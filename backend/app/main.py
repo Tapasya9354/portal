@@ -26,7 +26,7 @@ app = FastAPI(
         {"name": "Repositories", "description": "GitHub repository registration and verification."},
     ],
 )
-cors_origins_str = os.getenv("CORS_ORIGINS", "http://localhost:5173")
+cors_origins_str = os.getenv("CORS_ORIGINS", "http://localhost:5173,https://prreviewer.nik-server.in")
 cors_origins = [origin.strip() for origin in cors_origins_str.split(",")]
 
 app.add_middleware(
