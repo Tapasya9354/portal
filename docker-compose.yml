@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: pr_reviewer_backend
+    volumes:
+      - /mnt/Main/PRreviewer:/data
+    environment:
+      - SQLITE_DATABASE=/data/pr_reviewer.db
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: pr_reviewer_frontend
+    ports:
+      - "1805:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+

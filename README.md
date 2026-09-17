@@ -5,6 +5,7 @@ React frontend and FastAPI backend for registering GitHub repositories.
 ## Frontend
 
 ```powershell
+cd frontend
 npm install
 npm run dev
 ```
