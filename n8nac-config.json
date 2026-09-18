@@ -1,0 +1,24 @@
+{
+  "version": 4,
+  "activeEnvironmentId": "hackathon-2",
+  "environmentTargets": [
+    {
+      "id": "hackathon",
+      "name": "hackathon",
+      "kind": "external-instance",
+      "url": "https://n8n.nik-server.in"
+    }
+  ],
+  "environments": [
+    {
+      "id": "hackathon-2",
+      "name": "hackathon",
+      "syncSlug": "hackathon",
+      "environmentTargetId": "hackathon",
+      "projectId": "personal",
+      "projectName": "Personal",
+      "workflowsPath": "workflows/hackathon",
+      "folderSync": true
+    }
+  ]
+}
