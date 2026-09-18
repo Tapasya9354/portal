@@ -80,6 +80,23 @@ class RepositoryResponse(BaseModel):
 
 DATABASE_PATH = Path(os.getenv("SQLITE_DATABASE", Path(__file__).resolve().parents[1] / "pr_reviewer.db"))
 
+ARCHITECTURE_RULES_PATH = "PR Reviewer/architecture-rules.md"
+TECH_STACK_PATH = "PR Reviewer/tech-stack.md"
+ARCHITECTURE_RULES_TEMPLATE = """# Architecture Rules
+
+Describe the architectural rules the PR Reviewer's Architecture Agent should enforce, \
+for example layering boundaries, module ownership, disallowed dependencies, or naming conventions.
+
+- (Add your rules here)
+"""
+TECH_STACK_TEMPLATE = """# Tech Stack
+
+Describe the project's tech stack so the PR Reviewer agents have accurate context, \
+for example languages, frameworks, libraries, and infrastructure.
+
+- (Add your stack details here)
+"""
+
 
 def initialize_database() -> None:
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -137,7 +154,11 @@ async def create_review_config(repository_url: str, username: str, app_password:
             "code_quality": True,
             "regression": True,
             "alignment": True,
-        }
+        },
+        "rules": {
+            "architectural_rules_path": ARCHITECTURE_RULES_PATH,
+            "tech_stack_path": TECH_STACK_PATH,
+        },
     }
     try:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -153,7 +174,12 @@ async def create_review_config(repository_url: str, username: str, app_password:
             tree_payload = tree_response.json()
             tree_entries = list(tree_payload.get("tree", []))
             existing_paths = {entry.get("path") for entry in tree_entries}
-            for generated_path in ("PR Reviewer/config.json", "PR Reviewer/index.json"):
+            for generated_path in (
+                "PR Reviewer/config.json",
+                "PR Reviewer/index.json",
+                ARCHITECTURE_RULES_PATH,
+                TECH_STACK_PATH,
+            ):
                 if generated_path not in existing_paths:
                     tree_entries.append({"path": generated_path, "mode": "100644", "type": "blob"})
             index = {
@@ -170,10 +196,15 @@ async def create_review_config(repository_url: str, username: str, app_password:
                 ],
             }
 
-            for file_path, document, commit_message in (
-                ("PR Reviewer/config.json", config, "Initialize PR Reviewer agent configuration"),
-                ("PR Reviewer/index.json", index, "Update PR Reviewer repository index"),
-            ):
+            # config.json/index.json are refreshed every registration; the rules files are only seeded once so manual edits stick.
+            managed_files = (
+                ("PR Reviewer/config.json", json.dumps(config, indent=2), "Initialize PR Reviewer agent configuration", True),
+                ("PR Reviewer/index.json", json.dumps(index, indent=2), "Update PR Reviewer repository index", True),
+                (ARCHITECTURE_RULES_PATH, ARCHITECTURE_RULES_TEMPLATE, "Seed PR Reviewer architecture rules", False),
+                (TECH_STACK_PATH, TECH_STACK_TEMPLATE, "Seed PR Reviewer tech stack notes", False),
+            )
+
+            for file_path, content, commit_message, always_overwrite in managed_files:
                 existing = await client.get(
                     f"{api_root}/contents/{quote(file_path, safe='/')}?ref={quote(default_branch, safe='')}",
                     headers=headers,
@@ -181,10 +212,12 @@ async def create_review_config(repository_url: str, username: str, app_password:
                 )
                 if existing.status_code not in (200, 404):
                     existing.raise_for_status()
+                if existing.status_code == 200 and not always_overwrite:
+                    continue
 
                 payload = {
                     "message": commit_message,
-                    "content": b64encode(json.dumps(document, indent=2).encode()).decode(),
+                    "content": b64encode(content.encode()).decode(),
                     "branch": default_branch,
                 }
                 if existing.status_code == 200:
