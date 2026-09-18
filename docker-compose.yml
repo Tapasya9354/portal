@@ -6,6 +6,8 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: pr_reviewer_backend
+    ports:
+      - "1806:8000"
     volumes:
       - /mnt/Main/PRreviewer:/data
     env_file:
