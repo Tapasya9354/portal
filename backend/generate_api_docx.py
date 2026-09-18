@@ -194,6 +194,25 @@ def create_document():
             ]
         },
         {
+            "tag": "Repositories",
+            "method": "GET",
+            "path": "/api/repositories/credentials",
+            "summary": "Fetch Decrypted GitHub Credentials for n8n Workflows",
+            "desc": "Internal automated endpoint used by the n8n CodeGuards PR Reviewer pipeline. Authenticates via X-Internal-Token header, decrypts the stored PAT, and returns the username and token so all GitHub API calls (PR metadata, diff, rules, file reading, and review posting) execute with the repository owner's GitHub credentials.",
+            "request_body": "None",
+            "params": "full_name (Query String, Required, string, e.g. 'owner/repo')",
+            "responses": [
+                ("200 OK", '''{
+  "github_username": "octocat",
+  "github_pat": "ghp_PersonalAccessTokenOrAppPassword"
+}'''),
+                ("401 Unauthorized", '{"detail": "Missing or invalid X-Internal-Token header."}'),
+                ("404 Not Found", '{"detail": "Repository \'owner/repo\' not found."}'),
+                ("400 Bad Request", '{"detail": "Repository token is not available. Please re-register the repository."}'),
+                ("503 Service Unavailable", '{"detail": "N8N_INTERNAL_TOKEN is not configured."}')
+            ]
+        },
+        {
             "tag": "KT Chatbot",
             "method": "POST",
             "path": "/api/kt/chat",

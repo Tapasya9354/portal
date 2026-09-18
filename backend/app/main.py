@@ -549,22 +549,38 @@ async def list_repositories() -> list[RepositoryListItem]:
 async def get_repository_credentials(
     full_name: str,
     x_internal_token: str = Header(default=""),
+    authorization: str = Header(default=""),
 ) -> RepositoryCredentials:
     expected_token = os.getenv("N8N_INTERNAL_TOKEN")
     if not expected_token:
         raise HTTPException(status_code=503, detail="N8N_INTERNAL_TOKEN is not configured.")
-    if not x_internal_token or not secrets.compare_digest(x_internal_token, expected_token):
+
+    token = x_internal_token
+    if not token and authorization:
+        token = authorization.replace("Bearer ", "").strip()
+
+    if not token or not secrets.compare_digest(token, expected_token):
         raise HTTPException(status_code=401, detail="Missing or invalid X-Internal-Token header.")
+
+    clean_name = full_name.strip().rstrip("/")
+    if "github.com/" in clean_name:
+        clean_name = clean_name.split("github.com/")[-1]
 
     with sqlite3.connect(DATABASE_PATH) as connection:
         connection.row_factory = sqlite3.Row
         repo = connection.execute(
-            "SELECT github_username, app_password_encrypted FROM repositories WHERE full_name = ?",
-            (full_name,),
+            """
+            SELECT github_username, app_password_encrypted 
+            FROM repositories 
+            WHERE full_name = ? COLLATE NOCASE
+               OR repository_url LIKE ? COLLATE NOCASE
+            LIMIT 1
+            """,
+            (clean_name, f"%{clean_name}"),
         ).fetchone()
 
     if not repo:
-        raise HTTPException(status_code=404, detail="Repository not found.")
+        raise HTTPException(status_code=404, detail=f"Repository '{full_name}' not found.")
     if not repo["app_password_encrypted"]:
         raise HTTPException(status_code=400, detail="Repository token is not available. Please re-register the repository.")
 
