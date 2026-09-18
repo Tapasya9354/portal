@@ -12,7 +12,7 @@ from urllib.parse import quote
 import httpx
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
@@ -45,12 +45,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Symmetric encryption for secure PAT storage and retrieval
+# Symmetric encryption for secure PAT storage and retrieval.
+# Must be set explicitly (no hardcoded fallback) since it protects stored GitHub tokens.
 FERNET_KEY = os.getenv("ENCRYPTION_SECRET_KEY")
 if not FERNET_KEY:
-    # Stable fallback key for development if not set in environment
-    FERNET_KEY = "Qh768RvCVZfJpWcyzEBElBqAJhTiEDQeRwgiGP8uSeE="
+    raise RuntimeError(
+        "ENCRYPTION_SECRET_KEY is not set. Generate one with: "
+        "python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+    )
 
 fernet = Fernet(FERNET_KEY.encode() if isinstance(FERNET_KEY, str) else FERNET_KEY)
 
@@ -110,6 +112,13 @@ class RepositoryListItem(BaseModel):
     status: str
     webhook_registered: bool
     created_at: str
+
+
+class RepositoryCredentials(BaseModel):
+    """Decrypted GitHub credentials for internal n8n workflow use only."""
+
+    github_username: str
+    github_pat: str
 
 
 class ChatRequest(BaseModel):
@@ -521,6 +530,50 @@ async def list_repositories() -> list[RepositoryListItem]:
             )
             for row in rows
         ]
+
+
+@app.get(
+    "/api/repositories/credentials",
+    response_model=RepositoryCredentials,
+    tags=["Repositories"],
+    summary="Fetch decrypted GitHub credentials for a registered repository",
+    description="Internal endpoint for the n8n PR Reviewer workflow only. Requires the X-Internal-Token header.",
+    response_description="The repository's GitHub username and decrypted personal access token.",
+    responses={
+        401: {"description": "Missing or invalid X-Internal-Token header."},
+        404: {"description": "Repository not found."},
+        500: {"description": "Failed to decrypt the stored token."},
+        503: {"description": "N8N_INTERNAL_TOKEN is not configured."},
+    },
+)
+async def get_repository_credentials(
+    full_name: str,
+    x_internal_token: str = Header(default=""),
+) -> RepositoryCredentials:
+    expected_token = os.getenv("N8N_INTERNAL_TOKEN")
+    if not expected_token:
+        raise HTTPException(status_code=503, detail="N8N_INTERNAL_TOKEN is not configured.")
+    if not x_internal_token or not secrets.compare_digest(x_internal_token, expected_token):
+        raise HTTPException(status_code=401, detail="Missing or invalid X-Internal-Token header.")
+
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.row_factory = sqlite3.Row
+        repo = connection.execute(
+            "SELECT github_username, app_password_encrypted FROM repositories WHERE full_name = ?",
+            (full_name,),
+        ).fetchone()
+
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found.")
+    if not repo["app_password_encrypted"]:
+        raise HTTPException(status_code=400, detail="Repository token is not available. Please re-register the repository.")
+
+    try:
+        pat = decrypt_token(repo["app_password_encrypted"])
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Failed to decrypt repository token.") from exc
+
+    return RepositoryCredentials(github_username=repo["github_username"], github_pat=pat)
 
 
 @app.post(
