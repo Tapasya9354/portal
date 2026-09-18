@@ -8,6 +8,8 @@ services:
     container_name: pr_reviewer_backend
     volumes:
       - /mnt/Main/PRreviewer:/data
+    env_file:
+      - ./backend/.env
     environment:
       - SQLITE_DATABASE=/data/pr_reviewer.db
     restart: unless-stopped

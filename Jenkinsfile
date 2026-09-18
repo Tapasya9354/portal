@@ -50,6 +50,17 @@ pipeline {
             }
         }
 
+        stage('Prepare Backend Env') {
+            steps {
+                withCredentials([file(credentialsId: 'portal-backend-env', variable: 'BACKEND_ENV_FILE')]) {
+                    sh '''
+                        set -eux
+                        install -m 600 "$BACKEND_ENV_FILE" backend/.env
+                    '''
+                }
+            }
+        }
+
         stage('Deploy Prod') {
             steps {
                 sh '''
@@ -58,6 +69,12 @@ pipeline {
                     docker compose up -d --build
                 '''
             }
+        }
+    }
+
+    post {
+        always {
+            sh 'rm -f backend/.env || true'
         }
     }
 }
