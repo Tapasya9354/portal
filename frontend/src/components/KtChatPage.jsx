@@ -141,7 +141,17 @@ export default function KtChatPage({ onBack }) {
         })
       });
 
-      if (!res.ok) throw new Error('Failed to send message');
+      if (!res.ok) {
+        // Surface the backend's actual rejection reason instead of a generic message.
+        let detail = `Failed to send message (${res.status}).`;
+        try {
+          const body = await res.json();
+          if (body?.detail) detail = body.detail;
+        } catch {
+          // Response body wasn't JSON; keep the generic message.
+        }
+        throw new Error(detail);
+      }
       
       // If it's a new session, refresh session list
       if (!selectedSessionId) {
@@ -151,6 +161,12 @@ export default function KtChatPage({ onBack }) {
     } catch (err) {
       console.error(err);
       alert(err.message);
+      // Stop the placeholder bubble from spinning forever when the request never made it to n8n.
+      setMessages(prev => prev.map(m => (
+        m.role === 'assistant' && m.status === 'processing'
+          ? { ...m, status: 'error', content: err.message }
+          : m
+      )));
     } finally {
       setIsSending(false);
     }
