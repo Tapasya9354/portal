@@ -642,6 +642,11 @@
   gap: 8px;
 }
 
+.bulk-fix-panel-failed {
+  border-color: #fecaca;
+  background: #fef2f2;
+}
+
 .bulk-fix-header {
   display: flex;
   align-items: flex-start;

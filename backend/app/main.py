@@ -252,19 +252,6 @@ class RepositoryReviews(BaseModel):
     pull_requests: list[PullRequestReview] = []
 
 
-class FixSuggestionRequest(BaseModel):
-    """Request to generate a code fix for a single AI review comment."""
-
-    repository_id: int
-    pr_number: int
-    comment_id: str = Field(min_length=1, description="GitHub review comment id the fix addresses.")
-    path: str = Field(min_length=1)
-    line: int | None = None
-    severity: str = "blocker"
-    category: str = "general"
-    body: str = Field(min_length=1, description="The review comment text to resolve.")
-
-
 class FixComment(BaseModel):
     """One review comment included in a batched fix."""
 
@@ -1470,6 +1457,28 @@ def row_to_build_check(row: sqlite3.Row) -> BuildCheckItem:
 
 SEVERITY_RANK = {"blocker": 0, "warning": 1, "suggestion": 2}
 
+# A workflow that dies before its callback (n8n crash, unreachable backend) would otherwise
+# leave the dashboard spinning forever, so anything still pending past this window is failed.
+STALE_RUN_MINUTES = int(os.getenv("WORKFLOW_STALE_MINUTES", "10"))
+STALE_RUN_MESSAGE = (
+    "The workflow did not report back in time. It may have hit an API quota or an execution limit. "
+    "Try again."
+)
+
+
+def expire_stale_runs() -> None:
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.execute(
+            "UPDATE fix_suggestions SET status = 'error', explanation = ? "
+            f"WHERE status = 'processing' AND created_at <= datetime('now', '-{STALE_RUN_MINUTES} minutes')",
+            (STALE_RUN_MESSAGE,),
+        )
+        connection.execute(
+            "UPDATE build_checks SET status = 'error', summary = ? "
+            f"WHERE status = 'processing' AND created_at <= datetime('now', '-{STALE_RUN_MINUTES} minutes')",
+            (STALE_RUN_MESSAGE,),
+        )
+
 
 async def create_fix_suggestion(
     repository_id: int,
@@ -1552,34 +1561,6 @@ async def create_fix_suggestion(
 
 
 @app.post(
-    "/api/reviews/suggestions",
-    response_model=FixSuggestionItem,
-    status_code=202,
-    tags=["Fix Suggestions"],
-    summary="Generate a code fix for an AI review comment",
-    response_description="A pending suggestion; poll the list endpoint until its status is 'completed'.",
-    responses={
-        404: {"description": "Repository not found."},
-        502: {"description": "GitHub or n8n could not be reached."},
-        503: {"description": "N8N_CODE_FIX_WEBHOOK_URL is not configured."},
-    },
-)
-async def request_fix_suggestion(
-    payload: FixSuggestionRequest,
-    user_id: str = Depends(get_current_user_id),
-) -> FixSuggestionItem:
-    comment = FixComment(
-        id=payload.comment_id,
-        path=payload.path,
-        line=payload.line,
-        severity=payload.severity,
-        category=payload.category,
-        body=payload.body,
-    )
-    return await create_fix_suggestion(payload.repository_id, payload.pr_number, [comment], user_id)
-
-
-@app.post(
     "/api/reviews/suggestions/bulk",
     response_model=FixSuggestionItem,
     status_code=202,
@@ -1642,6 +1623,7 @@ async def list_fix_suggestions(
     user_id: str = Depends(get_current_user_id),
 ) -> list[FixSuggestionItem]:
     load_repository_for_user(repository_id, user_id)
+    expire_stale_runs()
     with sqlite3.connect(DATABASE_PATH) as connection:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
@@ -1920,6 +1902,7 @@ async def read_build_check(
     user_id: str = Depends(get_current_user_id),
 ) -> BuildCheckItem | None:
     load_repository_for_user(repository_id, user_id)
+    expire_stale_runs()
     with sqlite3.connect(DATABASE_PATH) as connection:
         connection.row_factory = sqlite3.Row
         row = connection.execute(

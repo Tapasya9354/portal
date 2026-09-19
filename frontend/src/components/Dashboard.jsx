@@ -96,12 +96,10 @@ async function triggerWorkflow(dispatch) {
   if (!res.ok) throw new Error(`The n8n workflow could not be started (${res.status}).`);
 }
 
-// One suggestion per review comment, plus one combined "fix everything" suggestion per PR.
+// One combined "fix every blocker" suggestion per PR, refreshed until the agent reports back.
 function useFixSuggestions(repoId, prNumber, enabled) {
   const { getToken } = useAuth();
-  const [byComment, setByComment] = useState({});
   const [bulk, setBulk] = useState(null);
-  const [busyComment, setBusyComment] = useState('');
   const [busyBulk, setBusyBulk] = useState(false);
   const [error, setError] = useState('');
 
@@ -111,14 +109,8 @@ function useFixSuggestions(repoId, prNumber, enabled) {
       `/api/reviews/suggestions?repository_id=${repoId}&pr_number=${prNumber}`,
       token,
     );
-    // The API returns newest first, so the first entry per comment is the current one.
-    const map = {};
-    for (const item of list) {
-      if (item.is_bulk) continue;
-      if (!map[item.comment_id]) map[item.comment_id] = item;
-    }
-    setByComment(map);
-    setBulk(list.find((item) => item.is_bulk) || null);
+    // The API returns newest first, and the portal only ever creates one combined run per PR.
+    setBulk(list[0] || null);
   }, [getToken, repoId, prNumber]);
 
   useEffect(() => {
@@ -133,42 +125,12 @@ function useFixSuggestions(repoId, prNumber, enabled) {
   }, [enabled, refresh]);
 
   useEffect(() => {
-    if (!enabled) return undefined;
-    const pending =
-      bulk?.status === 'processing' || Object.values(byComment).some((s) => s.status === 'processing');
-    if (!pending) return undefined;
+    if (!enabled || bulk?.status !== 'processing') return undefined;
     const timer = setTimeout(() => {
       refresh().catch(() => {});
     }, POLL_INTERVAL_MS);
     return () => clearTimeout(timer);
-  }, [enabled, byComment, bulk, refresh]);
-
-  const requestFix = useCallback(
-    async (comment) => {
-      setError('');
-      setBusyComment(comment.id);
-      try {
-        const token = await getToken();
-        const suggestion = await postJson('/api/reviews/suggestions', token, {
-          repository_id: repoId,
-          pr_number: prNumber,
-          comment_id: comment.id,
-          path: comment.path,
-          line: comment.line ?? null,
-          severity: comment.severity,
-          category: comment.category,
-          body: comment.body,
-        });
-        setByComment((current) => ({ ...current, [comment.id]: suggestion }));
-        await triggerWorkflow(suggestion.dispatch);
-      } catch (err) {
-        setError(err.message);
-      } finally {
-        setBusyComment('');
-      }
-    },
-    [getToken, repoId, prNumber],
-  );
+  }, [enabled, bulk, refresh]);
 
   const requestBulkFix = useCallback(
     async (comments) => {
@@ -202,24 +164,20 @@ function useFixSuggestions(repoId, prNumber, enabled) {
   const approveFix = useCallback(
     async (suggestion) => {
       setError('');
-      if (suggestion.is_bulk) setBusyBulk(true);
-      else setBusyComment(suggestion.comment_id);
+      setBusyBulk(true);
       try {
         const token = await getToken();
-        const applied = await postJson(`/api/reviews/suggestions/${suggestion.id}/approve`, token);
-        if (applied.is_bulk) setBulk(applied);
-        else setByComment((current) => ({ ...current, [applied.comment_id]: applied }));
+        setBulk(await postJson(`/api/reviews/suggestions/${suggestion.id}/approve`, token));
       } catch (err) {
         setError(err.message);
       } finally {
         setBusyBulk(false);
-        setBusyComment('');
       }
     },
     [getToken],
   );
 
-  return { byComment, bulk, busyComment, busyBulk, error, requestFix, requestBulkFix, approveFix };
+  return { bulk, busyBulk, error, requestBulkFix, approveFix };
 }
 
 function useBuildCheck(repoId, prNumber, enabled) {
@@ -440,81 +398,25 @@ function SuggestedFileBlock({ file }) {
   );
 }
 
-function FixSuggestionPanel({ comment, suggestion, busy, onRequest, onApprove }) {
-  if (!suggestion) {
-    return (
-      <div className="fix-panel-actions">
-        <button type="button" className="suggest-fix-button" disabled={busy} onClick={() => onRequest(comment)}>
-          {busy ? 'Starting…' : '✨ Suggest a fix'}
-        </button>
-      </div>
-    );
-  }
-
-  if (suggestion.status === 'processing') {
-    return <p className="fix-panel-status">⏳ The fix agent is writing a patch for this comment…</p>;
-  }
-
-  if (suggestion.status === 'error' || suggestion.status === 'empty') {
-    return (
-      <div className="fix-panel">
-        <p className="fix-panel-status">
-          {suggestion.status === 'empty'
-            ? 'The fix agent could not produce a safe code change for this comment.'
-            : 'The fix agent failed to generate a suggestion.'}
-        </p>
-        {suggestion.explanation && <p className="comment-body">{suggestion.explanation}</p>}
-        <div className="fix-panel-actions">
-          <button type="button" className="suggest-fix-button" disabled={busy} onClick={() => onRequest(comment)}>
-            Try again
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="fix-panel">
-      <div className="fix-panel-header">
-        <strong>Proposed fix</strong>
-        <span className="fix-panel-files">
-          {suggestion.files.length} file{suggestion.files.length === 1 ? '' : 's'}
-        </span>
-      </div>
-      {suggestion.explanation && <p className="comment-body">{suggestion.explanation}</p>}
-      {suggestion.files.map((file) => (
-        <SuggestedFileBlock key={file.path} file={file} />
-      ))}
-      {suggestion.status === 'applied' ? (
-        <div className="fix-panel-actions">
-          <span className="badge badge-clean">PR created</span>
-          <a className="pr-link" href={suggestion.fix_pr_url} target="_blank" rel="noreferrer">
-            {suggestion.fix_branch} → {suggestion.head_branch} ↗
-          </a>
-        </div>
-      ) : (
-        <div className="fix-panel-actions">
-          <button type="button" className="primary-button small" disabled={busy} onClick={() => onApprove(suggestion)}>
-            {busy ? 'Opening PR…' : `Approve & open PR into ${suggestion.head_branch}`}
-          </button>
-          <button type="button" className="suggest-fix-button" disabled={busy} onClick={() => onRequest(comment)}>
-            Regenerate
-          </button>
-        </div>
-      )}
-    </div>
-  );
-}
-
 // One click: patch every priority comment on the PR and open a single pull request.
 function BulkFixPanel({ comments, headBranch, suggestion, busy, onRequest, onApprove }) {
   if (comments.length === 0) return null;
 
-  const label = `⚡ Fix all ${comments.length} priority comment${comments.length === 1 ? '' : 's'}`;
+  const status = suggestion?.status;
+  const processing = status === 'processing';
+  const failed = status === 'error' || status === 'empty';
   const start = () => onRequest(comments);
 
+  const actionLabel = busy
+    ? 'Starting…'
+    : processing
+      ? 'Restart run'
+      : suggestion
+        ? 'Regenerate'
+        : `⚡ Fix all ${comments.length} priority comment${comments.length === 1 ? '' : 's'}`;
+
   return (
-    <div className="bulk-fix-panel">
+    <div className={`bulk-fix-panel ${failed ? 'bulk-fix-panel-failed' : ''}`}>
       <div className="bulk-fix-header">
         <div>
           <strong>Global fix</strong>
@@ -523,35 +425,66 @@ function BulkFixPanel({ comments, headBranch, suggestion, busy, onRequest, onApp
             <code>{headBranch}</code>.
           </p>
         </div>
-        {(!suggestion || suggestion.status === 'empty' || suggestion.status === 'error') && (
-          <button type="button" className="primary-button small" disabled={busy} onClick={start}>
-            {busy ? 'Starting…' : suggestion ? 'Try again' : label}
-          </button>
-        )}
+        <button
+          type="button"
+          className={processing || suggestion ? 'suggest-fix-button' : 'primary-button small'}
+          disabled={busy}
+          onClick={start}
+        >
+          {actionLabel}
+        </button>
       </div>
 
-      {suggestion?.status === 'processing' && (
-        <p className="fix-panel-status">⏳ The fix agent is patching {comments.length} comments in one pass…</p>
-      )}
-      {(suggestion?.status === 'empty' || suggestion?.status === 'error') && (
+      {processing && (
         <p className="fix-panel-status">
-          {suggestion.explanation || 'The fix agent could not produce a combined patch.'}
+          ⏳ The fix agent is patching {comments.length} comments in one pass… If it stalls, use Restart run.
         </p>
       )}
-      {(suggestion?.status === 'completed' || suggestion?.status === 'applied') && (
-        <FixSuggestionPanel
-          comment={comments}
-          suggestion={suggestion}
-          busy={busy}
-          onRequest={start}
-          onApprove={onApprove}
-        />
+      {failed && (
+        <p className="form-message form-message-error">
+          {suggestion.explanation ||
+            'The fix agent run did not complete. It may have hit an API quota or an iteration limit.'}
+        </p>
+      )}
+      {(status === 'completed' || status === 'applied') && (
+        <div className="fix-panel">
+          <div className="fix-panel-header">
+            <strong>Proposed fix</strong>
+            <span className="fix-panel-files">
+              {suggestion.files.length} file{suggestion.files.length === 1 ? '' : 's'} ·{' '}
+              {comments.length} comment{comments.length === 1 ? '' : 's'}
+            </span>
+          </div>
+          {suggestion.explanation && <p className="comment-body">{suggestion.explanation}</p>}
+          {suggestion.files.map((file) => (
+            <SuggestedFileBlock key={file.path} file={file} />
+          ))}
+          {status === 'applied' ? (
+            <div className="fix-panel-actions">
+              <span className="badge badge-clean">PR created</span>
+              <a className="pr-link" href={suggestion.fix_pr_url} target="_blank" rel="noreferrer">
+                {suggestion.fix_branch} → {suggestion.head_branch} ↗
+              </a>
+            </div>
+          ) : (
+            <div className="fix-panel-actions">
+              <button
+                type="button"
+                className="primary-button small"
+                disabled={busy}
+                onClick={() => onApprove(suggestion)}
+              >
+                {busy ? 'Opening PR…' : `Approve & open PR into ${suggestion.head_branch}`}
+              </button>
+            </div>
+          )}
+        </div>
       )}
     </div>
   );
 }
 
-function CommentCard({ comment, showAgent, fix }) {
+function CommentCard({ comment, showAgent }) {
   return (
     <li className={`comment-card comment-card-${comment.severity}`}>
       <div className="comment-card-header">
@@ -573,15 +506,6 @@ function CommentCard({ comment, showAgent, fix }) {
           View comment on GitHub ↗
         </a>
       )}
-      {fix && (
-        <FixSuggestionPanel
-          comment={comment}
-          suggestion={fix.suggestion}
-          busy={fix.busy}
-          onRequest={fix.onRequest}
-          onApprove={fix.onApprove}
-        />
-      )}
     </li>
   );
 }
@@ -589,7 +513,7 @@ function CommentCard({ comment, showAgent, fix }) {
 const FINAL_TAB_ID = 'final';
 
 // Per-PR tabs: one tab per review agent plus the master triage result posted on the PR.
-function PrCommentTabs({ pr, sortedComments, fixes }) {
+function PrCommentTabs({ pr, sortedComments }) {
   const [activeTab, setActiveTab] = useState(categoryOrder[0]);
 
   // The triage agent can emit a category outside the four known agents; keep those visible too.
@@ -656,21 +580,10 @@ function PrCommentTabs({ pr, sortedComments, fixes }) {
       ) : (
         <ul className="comment-list">
           {activeComments.map((comment) => (
-            <CommentCard
-              key={comment.id}
-              comment={comment}
-              showAgent={activeTab === FINAL_TAB_ID}
-              fix={{
-                suggestion: fixes.byComment[comment.id],
-                busy: fixes.busyComment === comment.id,
-                onRequest: fixes.requestFix,
-                onApprove: fixes.approveFix,
-              }}
-            />
+            <CommentCard key={comment.id} comment={comment} showAgent={activeTab === FINAL_TAB_ID} />
           ))}
         </ul>
       )}
-      {fixes.error && <p className="form-message form-message-error">{fixes.error}</p>}
     </div>
   );
 }
@@ -781,7 +694,7 @@ function PrCard({ pr, isOpen, onToggle }) {
           {pr.comments.length === 0 ? (
             <p className="empty-note">No AI review comments have been posted on this PR yet.</p>
           ) : (
-            <PrCommentTabs pr={pr} sortedComments={sortedComments} fixes={fixes} />
+            <PrCommentTabs pr={pr} sortedComments={sortedComments} />
           )}
         </div>
       )}
@@ -941,17 +854,7 @@ function HighPriorityPrGroup({ pr, comments }) {
       />
       <ul className="comment-list">
         {comments.map((comment) => (
-          <CommentCard
-            key={comment.id}
-            comment={comment}
-            showAgent
-            fix={{
-              suggestion: fixes.byComment[comment.id],
-              busy: fixes.busyComment === comment.id,
-              onRequest: fixes.requestFix,
-              onApprove: fixes.approveFix,
-            }}
-          />
+          <CommentCard key={comment.id} comment={comment} showAgent />
         ))}
       </ul>
       {fixes.error && <p className="form-message form-message-error">{fixes.error}</p>}
@@ -974,8 +877,8 @@ function HighPriorityTab({ allPrs, repoCount }) {
   return (
     <div className="high-priority-tab">
       <p className="tab-intro">
-        {total} blocker comment{total === 1 ? '' : 's'} currently open across {repoCount} repositories. Generate a
-        fix on any of them and approve it to open a PR into the reviewed branch.
+        {total} blocker comment{total === 1 ? '' : 's'} currently open across {repoCount} repositories. Generate one
+        combined fix per pull request and approve it to open a PR into the reviewed branch.
       </p>
       {groups.map((g) => (
         <HighPriorityPrGroup key={g.pr.id} pr={g.pr} comments={g.comments} />
