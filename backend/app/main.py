@@ -32,6 +32,8 @@ app = FastAPI(
         {"name": "System", "description": "Service health and readiness endpoints."},
         {"name": "Repositories", "description": "GitHub repository registration and retrieval."},
         {"name": "Reviews", "description": "Open pull requests and AI agent review comments per repository."},
+        {"name": "Fix Suggestions", "description": "AI-generated code fixes for review comments, and the PRs that apply them."},
+        {"name": "Build Check", "description": "Predicted `npm run build` outcome for a pull request head."},
         {"name": "KT Chatbot", "description": "Knowledge Transfer Chatbot interactions and callbacks."},
     ],
 )
@@ -250,6 +252,100 @@ class RepositoryReviews(BaseModel):
     pull_requests: list[PullRequestReview] = []
 
 
+class FixSuggestionRequest(BaseModel):
+    """Request to generate a code fix for a single AI review comment."""
+
+    repository_id: int
+    pr_number: int
+    comment_id: str = Field(min_length=1, description="GitHub review comment id the fix addresses.")
+    path: str = Field(min_length=1)
+    line: int | None = None
+    severity: str = "blocker"
+    category: str = "general"
+    body: str = Field(min_length=1, description="The review comment text to resolve.")
+
+
+class SuggestedFile(BaseModel):
+    """A full replacement file produced by the fix agent."""
+
+    path: str
+    content: str
+
+
+class FixSuggestionCallback(BaseModel):
+    """Callback payload sent by the n8n Code Fix Suggester workflow."""
+
+    suggestionId: int
+    status: str = "completed"
+    explanation: str = ""
+    files: list[SuggestedFile] = []
+
+
+class FixSuggestionItem(BaseModel):
+    """A generated fix suggestion and, once approved, the PR that applies it."""
+
+    id: int
+    repository_id: int
+    pr_number: int
+    comment_id: str
+    path: str
+    line: int | None = None
+    severity: str
+    category: str
+    comment_body: str
+    status: str
+    explanation: str = ""
+    files: list[SuggestedFile] = []
+    head_branch: str = ""
+    fix_pr_url: str = ""
+    fix_branch: str = ""
+    created_at: str = ""
+
+
+class BuildCheckRequest(BaseModel):
+    """Request a predicted `npm run build` outcome for a pull request head."""
+
+    repository_id: int
+    pr_number: int
+
+
+class BuildIssue(BaseModel):
+    """A single build-breaking problem detected on the PR head."""
+
+    path: str = ""
+    line: int | None = None
+    message: str
+    severity: str = "error"
+
+
+class BuildCheckCallback(BaseModel):
+    """Callback payload sent by the n8n Build Validator workflow."""
+
+    buildCheckId: int
+    status: str = "completed"
+    will_build: bool = True
+    confidence: str = "medium"
+    build_command: str = "npm run build"
+    summary: str = ""
+    issues: list[BuildIssue] = []
+
+
+class BuildCheckItem(BaseModel):
+    """Stored build validation result for a pull request."""
+
+    id: int
+    repository_id: int
+    pr_number: int
+    status: str
+    will_build: bool = True
+    confidence: str = "medium"
+    build_command: str = "npm run build"
+    summary: str = ""
+    issues: list[BuildIssue] = []
+    head_sha: str = ""
+    created_at: str = ""
+
+
 DATABASE_PATH = Path(os.getenv("SQLITE_DATABASE", Path(__file__).resolve().parents[1] / "pr_reviewer.db"))
 
 ARCHITECTURE_RULES_PATH = "PR Reviewer/architecture-rules.md"
@@ -309,6 +405,44 @@ def initialize_database() -> None:
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'completed',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS fix_suggestions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repository_id INTEGER NOT NULL REFERENCES repositories(id),
+                pr_number INTEGER NOT NULL,
+                comment_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                line INTEGER,
+                severity TEXT NOT NULL DEFAULT 'blocker',
+                category TEXT NOT NULL DEFAULT 'general',
+                comment_body TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'processing',
+                explanation TEXT NOT NULL DEFAULT '',
+                files_json TEXT NOT NULL DEFAULT '[]',
+                head_branch TEXT NOT NULL DEFAULT '',
+                head_sha TEXT NOT NULL DEFAULT '',
+                fix_branch TEXT NOT NULL DEFAULT '',
+                fix_pr_url TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS build_checks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repository_id INTEGER NOT NULL REFERENCES repositories(id),
+                pr_number INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'processing',
+                will_build INTEGER NOT NULL DEFAULT 1,
+                confidence TEXT NOT NULL DEFAULT 'medium',
+                build_command TEXT NOT NULL DEFAULT 'npm run build',
+                summary TEXT NOT NULL DEFAULT '',
+                issues_json TEXT NOT NULL DEFAULT '[]',
+                head_sha TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -1033,3 +1167,511 @@ async def list_chat_sessions(repository_id: int, user_id: str = Depends(get_curr
             )
             for row in rows
         ]
+
+
+GITHUB_HEADERS = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+
+
+def require_internal_token(token: str) -> None:
+    expected_token = os.getenv("N8N_INTERNAL_TOKEN")
+    if not expected_token:
+        raise HTTPException(status_code=503, detail="N8N_INTERNAL_TOKEN is not configured.")
+    if not token or not secrets.compare_digest(token, expected_token):
+        raise HTTPException(status_code=401, detail="Missing or invalid X-Internal-Token header.")
+
+
+def load_repository_for_user(repository_id: int, user_id: str) -> tuple[sqlite3.Row, str]:
+    """Return the caller's repository row together with its decrypted GitHub token."""
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.row_factory = sqlite3.Row
+        repo = connection.execute(
+            "SELECT id, repository_url, full_name, github_username, app_password_encrypted "
+            "FROM repositories WHERE id = ? AND clerk_user_id = ?",
+            (repository_id, user_id),
+        ).fetchone()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found.")
+    if not repo["app_password_encrypted"]:
+        raise HTTPException(status_code=400, detail="Repository token is not available. Please re-register the repository.")
+    try:
+        return repo, decrypt_token(repo["app_password_encrypted"])
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Failed to decrypt repository token.") from exc
+
+
+async def fetch_pull_request(owner: str, name: str, number: int, auth: tuple[str, str]) -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.get(
+                f"https://api.github.com/repos/{owner}/{name}/pulls/{number}",
+                headers=GITHUB_HEADERS,
+                auth=auth,
+            )
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=502, detail=f"GitHub rejected the request for PR #{number}.") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="GitHub could not be reached.") from exc
+
+
+async def dispatch_to_n8n(env_var: str, payload: dict) -> None:
+    webhook_url = os.getenv(env_var)
+    if not webhook_url:
+        raise HTTPException(status_code=503, detail=f"{env_var} is not configured.")
+    try:
+        async with httpx.AsyncClient(timeout=15, verify=False) as client:
+            response = await client.post(webhook_url, json=payload)
+            response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to trigger the n8n workflow: {exc}") from exc
+
+
+def callback_url_for(path: str) -> str:
+    backend_base = os.getenv("BACKEND_BASE_URL", "http://192.168.1.104:1806").rstrip("/")
+    return f"{backend_base}{path}"
+
+
+def row_to_suggestion(row: sqlite3.Row) -> FixSuggestionItem:
+    try:
+        files = [SuggestedFile(**f) for f in json.loads(row["files_json"] or "[]")]
+    except (json.JSONDecodeError, TypeError, ValueError):
+        files = []
+    return FixSuggestionItem(
+        id=row["id"],
+        repository_id=row["repository_id"],
+        pr_number=row["pr_number"],
+        comment_id=row["comment_id"],
+        path=row["path"],
+        line=row["line"],
+        severity=row["severity"],
+        category=row["category"],
+        comment_body=row["comment_body"],
+        status=row["status"],
+        explanation=row["explanation"] or "",
+        files=files,
+        head_branch=row["head_branch"] or "",
+        fix_pr_url=row["fix_pr_url"] or "",
+        fix_branch=row["fix_branch"] or "",
+        created_at=row["created_at"],
+    )
+
+
+def row_to_build_check(row: sqlite3.Row) -> BuildCheckItem:
+    try:
+        issues = [BuildIssue(**i) for i in json.loads(row["issues_json"] or "[]")]
+    except (json.JSONDecodeError, TypeError, ValueError):
+        issues = []
+    return BuildCheckItem(
+        id=row["id"],
+        repository_id=row["repository_id"],
+        pr_number=row["pr_number"],
+        status=row["status"],
+        will_build=bool(row["will_build"]),
+        confidence=row["confidence"] or "medium",
+        build_command=row["build_command"] or "npm run build",
+        summary=row["summary"] or "",
+        issues=issues,
+        head_sha=row["head_sha"] or "",
+        created_at=row["created_at"],
+    )
+
+
+@app.post(
+    "/api/reviews/suggestions",
+    response_model=FixSuggestionItem,
+    status_code=202,
+    tags=["Fix Suggestions"],
+    summary="Generate a code fix for an AI review comment",
+    response_description="A pending suggestion; poll the list endpoint until its status is 'completed'.",
+    responses={
+        404: {"description": "Repository not found."},
+        502: {"description": "GitHub or n8n could not be reached."},
+        503: {"description": "N8N_CODE_FIX_WEBHOOK_URL is not configured."},
+    },
+)
+async def request_fix_suggestion(
+    payload: FixSuggestionRequest,
+    user_id: str = Depends(get_current_user_id),
+) -> FixSuggestionItem:
+    repo, pat = load_repository_for_user(payload.repository_id, user_id)
+    owner, name = repo["full_name"].split("/", 1)
+    pr = await fetch_pull_request(owner, name, payload.pr_number, (repo["github_username"], pat))
+    head_branch = (pr.get("head") or {}).get("ref", "")
+    head_sha = (pr.get("head") or {}).get("sha", "")
+
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.row_factory = sqlite3.Row
+        cursor = connection.execute(
+            """
+            INSERT INTO fix_suggestions (
+                repository_id, pr_number, comment_id, path, line, severity, category,
+                comment_body, status, head_branch, head_sha
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?)
+            """,
+            (
+                payload.repository_id,
+                payload.pr_number,
+                payload.comment_id,
+                payload.path,
+                payload.line,
+                payload.severity,
+                payload.category,
+                payload.body,
+                head_branch,
+                head_sha,
+            ),
+        )
+        suggestion_id = cursor.lastrowid
+
+    try:
+        await dispatch_to_n8n(
+            "N8N_CODE_FIX_WEBHOOK_URL",
+            {
+                "suggestionId": suggestion_id,
+                "repoUrl": repo["repository_url"],
+                "owner": owner,
+                "repo": name,
+                "username": repo["github_username"],
+                "pat": pat,
+                "prNumber": payload.pr_number,
+                "headBranch": head_branch,
+                "headSha": head_sha,
+                "prTitle": pr.get("title", ""),
+                "prBody": pr.get("body") or "",
+                "comment": {
+                    "id": payload.comment_id,
+                    "path": payload.path,
+                    "line": payload.line,
+                    "severity": payload.severity,
+                    "category": payload.category,
+                    "body": payload.body,
+                },
+                "callbackUrl": callback_url_for("/api/reviews/suggestions/callback"),
+            },
+        )
+    except HTTPException:
+        with sqlite3.connect(DATABASE_PATH) as connection:
+            connection.execute(
+                "UPDATE fix_suggestions SET status = 'error', explanation = ? WHERE id = ?",
+                ("The fix suggester workflow could not be triggered.", suggestion_id),
+            )
+        raise
+
+    return await get_suggestion(suggestion_id, user_id)
+
+
+def is_safe_repo_path(path: str) -> bool:
+    """Reject absolute paths and traversal segments before committing agent-authored files."""
+    clean = (path or "").strip().replace("\\", "/")
+    if not clean or clean.startswith("/") or ":" in clean:
+        return False
+    return ".." not in clean.split("/")
+
+
+@app.post(
+    "/api/reviews/suggestions/callback",
+    tags=["Fix Suggestions"],
+    summary="Receive a generated fix from the n8n Code Fix Suggester",
+    response_description="Acknowledges receipt of the suggestion.",
+)
+async def fix_suggestion_callback(
+    callback: FixSuggestionCallback,
+    x_internal_token: str = Header(default=""),
+) -> dict[str, str]:
+    require_internal_token(x_internal_token)
+    files = [f.model_dump() for f in callback.files if is_safe_repo_path(f.path) and f.content]
+    status = callback.status if files or callback.status == "error" else "empty"
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.execute(
+            "UPDATE fix_suggestions SET status = ?, explanation = ?, files_json = ? WHERE id = ?",
+            (status, callback.explanation, json.dumps(files), callback.suggestionId),
+        )
+    return {"status": "ok"}
+
+
+@app.get(
+    "/api/reviews/suggestions",
+    response_model=list[FixSuggestionItem],
+    tags=["Fix Suggestions"],
+    summary="List generated fix suggestions for a pull request",
+    response_description="Suggestions in reverse-chronological order.",
+)
+async def list_fix_suggestions(
+    repository_id: int,
+    pr_number: int,
+    user_id: str = Depends(get_current_user_id),
+) -> list[FixSuggestionItem]:
+    load_repository_for_user(repository_id, user_id)
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            "SELECT * FROM fix_suggestions WHERE repository_id = ? AND pr_number = ? ORDER BY id DESC",
+            (repository_id, pr_number),
+        ).fetchall()
+    return [row_to_suggestion(row) for row in rows]
+
+
+async def get_suggestion(suggestion_id: int, user_id: str) -> FixSuggestionItem:
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            """
+            SELECT s.* FROM fix_suggestions s
+            JOIN repositories r ON s.repository_id = r.id
+            WHERE s.id = ? AND r.clerk_user_id = ?
+            """,
+            (suggestion_id, user_id),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Suggestion not found.")
+    return row_to_suggestion(row)
+
+
+@app.get(
+    "/api/reviews/suggestions/{suggestion_id}",
+    response_model=FixSuggestionItem,
+    tags=["Fix Suggestions"],
+    summary="Get a single fix suggestion",
+    response_description="The suggestion and its current status.",
+)
+async def read_fix_suggestion(
+    suggestion_id: int,
+    user_id: str = Depends(get_current_user_id),
+) -> FixSuggestionItem:
+    return await get_suggestion(suggestion_id, user_id)
+
+
+@app.post(
+    "/api/reviews/suggestions/{suggestion_id}/approve",
+    response_model=FixSuggestionItem,
+    tags=["Fix Suggestions"],
+    summary="Approve a fix and open a PR against the reviewed branch",
+    description="Commits the suggested files to a new branch and opens a pull request targeting the reviewed PR's head branch.",
+    response_description="The suggestion updated with the created pull request URL.",
+    responses={
+        400: {"description": "Suggestion is not ready to be applied."},
+        404: {"description": "Suggestion not found."},
+        502: {"description": "GitHub rejected the branch, commit, or pull request creation."},
+    },
+)
+async def approve_fix_suggestion(
+    suggestion_id: int,
+    user_id: str = Depends(get_current_user_id),
+) -> FixSuggestionItem:
+    suggestion = await get_suggestion(suggestion_id, user_id)
+    if suggestion.status == "applied" and suggestion.fix_pr_url:
+        return suggestion
+    if suggestion.status != "completed" or not suggestion.files:
+        raise HTTPException(status_code=400, detail="This suggestion has no generated changes to apply yet.")
+    if not suggestion.head_branch:
+        raise HTTPException(status_code=400, detail="The reviewed pull request's head branch is unknown.")
+
+    repo, pat = load_repository_for_user(suggestion.repository_id, user_id)
+    owner, name = repo["full_name"].split("/", 1)
+    api_root = f"https://api.github.com/repos/{owner}/{name}"
+    auth = (repo["github_username"], pat)
+    fix_branch = f"codeguards/fix-pr-{suggestion.pr_number}-{suggestion.id}"
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            ref = await client.get(
+                f"{api_root}/git/ref/heads/{quote(suggestion.head_branch, safe='')}",
+                headers=GITHUB_HEADERS,
+                auth=auth,
+            )
+            ref.raise_for_status()
+            base_sha = ref.json()["object"]["sha"]
+
+            created = await client.post(
+                f"{api_root}/git/refs",
+                headers=GITHUB_HEADERS,
+                auth=auth,
+                json={"ref": f"refs/heads/{fix_branch}", "sha": base_sha},
+            )
+            # 422 means the branch already exists from a previous approve attempt; reuse it.
+            if created.status_code != 422:
+                created.raise_for_status()
+
+            for file in suggestion.files:
+                existing = await client.get(
+                    f"{api_root}/contents/{quote(file.path, safe='/')}?ref={quote(fix_branch, safe='')}",
+                    headers=GITHUB_HEADERS,
+                    auth=auth,
+                )
+                if existing.status_code not in (200, 404):
+                    existing.raise_for_status()
+                body = {
+                    "message": f"fix(codeguards): resolve review comment on {file.path}",
+                    "content": b64encode(file.content.encode()).decode(),
+                    "branch": fix_branch,
+                }
+                if existing.status_code == 200:
+                    body["sha"] = existing.json()["sha"]
+                put = await client.put(
+                    f"{api_root}/contents/{quote(file.path, safe='/')}",
+                    headers=GITHUB_HEADERS,
+                    auth=auth,
+                    json=body,
+                )
+                put.raise_for_status()
+
+            pr_body = (
+                f"Automated fix generated by CodeGuards for a **{suggestion.severity}** "
+                f"{suggestion.category} comment on `{suggestion.path}`"
+                f"{f':{suggestion.line}' if suggestion.line else ''} in #{suggestion.pr_number}.\n\n"
+                f"> {suggestion.comment_body}\n\n"
+                f"### What changed\n{suggestion.explanation}\n"
+            )
+            pr_response = await client.post(
+                f"{api_root}/pulls",
+                headers=GITHUB_HEADERS,
+                auth=auth,
+                json={
+                    "title": f"CodeGuards fix for #{suggestion.pr_number}: {suggestion.path}",
+                    "head": fix_branch,
+                    "base": suggestion.head_branch,
+                    "body": pr_body,
+                },
+            )
+            if pr_response.status_code == 422:
+                # A PR for this branch already exists; return it instead of failing.
+                open_prs = await client.get(
+                    f"{api_root}/pulls",
+                    headers=GITHUB_HEADERS,
+                    auth=auth,
+                    params={"state": "open", "head": f"{owner}:{fix_branch}"},
+                )
+                open_prs.raise_for_status()
+                existing_prs = open_prs.json()
+                if not existing_prs:
+                    pr_response.raise_for_status()
+                fix_pr_url = existing_prs[0].get("html_url", "")
+            else:
+                pr_response.raise_for_status()
+                fix_pr_url = pr_response.json().get("html_url", "")
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"GitHub rejected the fix pull request ({exc.response.status_code}).",
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="GitHub could not be reached while opening the fix PR.") from exc
+
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.execute(
+            "UPDATE fix_suggestions SET status = 'applied', fix_branch = ?, fix_pr_url = ? WHERE id = ?",
+            (fix_branch, fix_pr_url, suggestion.id),
+        )
+    return await get_suggestion(suggestion_id, user_id)
+
+
+@app.post(
+    "/api/reviews/build-check",
+    response_model=BuildCheckItem,
+    status_code=202,
+    tags=["Build Check"],
+    summary="Predict whether `npm run build` will succeed on a PR head",
+    response_description="A pending build check; poll the GET endpoint until its status is 'completed'.",
+    responses={
+        404: {"description": "Repository not found."},
+        503: {"description": "N8N_BUILD_CHECK_WEBHOOK_URL is not configured."},
+    },
+)
+async def request_build_check(
+    payload: BuildCheckRequest,
+    user_id: str = Depends(get_current_user_id),
+) -> BuildCheckItem:
+    repo, pat = load_repository_for_user(payload.repository_id, user_id)
+    owner, name = repo["full_name"].split("/", 1)
+    pr = await fetch_pull_request(owner, name, payload.pr_number, (repo["github_username"], pat))
+    head_branch = (pr.get("head") or {}).get("ref", "")
+    head_sha = (pr.get("head") or {}).get("sha", "")
+
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        cursor = connection.execute(
+            "INSERT INTO build_checks (repository_id, pr_number, status, head_sha) VALUES (?, ?, 'processing', ?)",
+            (payload.repository_id, payload.pr_number, head_sha),
+        )
+        build_check_id = cursor.lastrowid
+
+    try:
+        await dispatch_to_n8n(
+            "N8N_BUILD_CHECK_WEBHOOK_URL",
+            {
+                "buildCheckId": build_check_id,
+                "repoUrl": repo["repository_url"],
+                "owner": owner,
+                "repo": name,
+                "username": repo["github_username"],
+                "pat": pat,
+                "prNumber": payload.pr_number,
+                "headBranch": head_branch,
+                "headSha": head_sha,
+                "callbackUrl": callback_url_for("/api/reviews/build-check/callback"),
+            },
+        )
+    except HTTPException:
+        with sqlite3.connect(DATABASE_PATH) as connection:
+            connection.execute(
+                "UPDATE build_checks SET status = 'error', summary = ? WHERE id = ?",
+                ("The build validator workflow could not be triggered.", build_check_id),
+            )
+        raise
+
+    return await read_build_check(payload.repository_id, payload.pr_number, user_id)
+
+
+@app.post(
+    "/api/reviews/build-check/callback",
+    tags=["Build Check"],
+    summary="Receive a build validation result from the n8n Build Validator",
+    response_description="Acknowledges receipt of the result.",
+)
+async def build_check_callback(
+    callback: BuildCheckCallback,
+    x_internal_token: str = Header(default=""),
+) -> dict[str, str]:
+    require_internal_token(x_internal_token)
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.execute(
+            """
+            UPDATE build_checks
+            SET status = ?, will_build = ?, confidence = ?, build_command = ?, summary = ?, issues_json = ?
+            WHERE id = ?
+            """,
+            (
+                callback.status,
+                1 if callback.will_build else 0,
+                callback.confidence,
+                callback.build_command,
+                callback.summary,
+                json.dumps([i.model_dump() for i in callback.issues]),
+                callback.buildCheckId,
+            ),
+        )
+    return {"status": "ok"}
+
+
+@app.get(
+    "/api/reviews/build-check",
+    response_model=BuildCheckItem | None,
+    tags=["Build Check"],
+    summary="Get the latest build validation result for a pull request",
+    response_description="The most recent build check, or null if none has been run.",
+)
+async def read_build_check(
+    repository_id: int,
+    pr_number: int,
+    user_id: str = Depends(get_current_user_id),
+) -> BuildCheckItem | None:
+    load_repository_for_user(repository_id, user_id)
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT * FROM build_checks WHERE repository_id = ? AND pr_number = ? ORDER BY id DESC LIMIT 1",
+            (repository_id, pr_number),
+        ).fetchone()
+    return row_to_build_check(row) if row else None
+
