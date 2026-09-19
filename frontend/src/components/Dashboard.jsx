@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useAuth, UserButton } from '@clerk/clerk-react';
 import { agentForCategory, categoryOrder, normalizeReviewEvent, severityOrder } from '../lib/reviewMeta.js';
 import './Dashboard.css';
@@ -527,6 +527,14 @@ export default function Dashboard({ onManageRepos, onOpenChat }) {
             <button className="primary-button" type="button" onClick={onOpenChat} style={{ marginLeft: '12px' }}>
               Ask AI
             </button>
+            <>
+              <button className="secondary-button" type="button" onClick={onManageRepos}>
+                Manage repositories
+              </button>
+              <button className="primary-button" type="button" onClick={onOpenChat} style={{ marginLeft: '12px' }}>
+                Ask AI
+              </button>
+            </>
           )}
           <UserButton afterSignOutUrl="/" />
         </div>
