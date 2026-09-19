@@ -186,6 +186,16 @@ class ChatResponseStatus(BaseModel):
     session_id: str
     status: str
     message: str
+    n8n_webhook_url: str | None = None
+    n8n_payload: dict | None = None
+
+
+class ChatCompleteRequest(BaseModel):
+    """Payload to complete an assistant message directly."""
+
+    session_id: str
+    response: str
+    status: str = "completed"
 
 
 class ChatCallback(BaseModel):
@@ -1198,16 +1208,23 @@ def match_kt_response(query: str, session_turn: int) -> str:
     tags=["KT Chatbot"],
     summary="Ask a question to the KT Chatbot",
     response_description="Returns acknowledgement that the query is dispatched for asynchronous processing.",
+    summary="Prepare and dispatch a question to the KT Chatbot",
+    response_description="Returns n8n dispatch payload for the frontend to call directly.",
     responses={
         400: {"description": "Repository credentials missing or need re-registration."},
         404: {"description": "Repository not found."},
     },
 )
 async def send_kt_chat_query(payload: ChatRequest, user_id: str = Depends(get_current_user_id)) -> ChatResponseStatus:
+    n8n_webhook_url = os.getenv("N8N_KT_CHAT_WEBHOOK_URL", "https://n8n.nik-server.in/webhook/kt-chatbot")
+    backend_base = os.getenv("BACKEND_BASE_URL", "http://192.168.1.104:1806").rstrip("/")
+    callback_url = f"{backend_base}/api/kt/chat/callback"
+
     with sqlite3.connect(DATABASE_PATH) as connection:
         connection.row_factory = sqlite3.Row
         repo = connection.execute(
             "SELECT id, repository_url, github_username FROM repositories WHERE id = ? AND clerk_user_id = ?",
+            "SELECT id, repository_url, github_username, app_password_encrypted FROM repositories WHERE id = ? AND clerk_user_id = ?",
             (payload.repository_id, user_id),
         ).fetchone()
 
@@ -1220,6 +1237,12 @@ async def send_kt_chat_query(payload: ChatRequest, user_id: str = Depends(get_cu
             (payload.session_id,),
         ).fetchone()
         session_turn = turn_row["count"] if turn_row else 0
+        pat = ""
+        if repo["app_password_encrypted"]:
+            try:
+                pat = decrypt_token(repo["app_password_encrypted"])
+            except Exception:
+                pass
 
         # Save user message
         connection.execute(
@@ -1231,16 +1254,81 @@ async def send_kt_chat_query(payload: ChatRequest, user_id: str = Depends(get_cu
         assistant_content = match_kt_response(payload.query, session_turn)
 
         # Save assistant message immediately as completed
+        # Create pending assistant placeholder
         connection.execute(
             "INSERT INTO chat_messages (repository_id, session_id, role, content, status) VALUES (?, ?, 'assistant', ?, 'completed')",
             (payload.repository_id, payload.session_id, assistant_content),
+            "INSERT INTO chat_messages (repository_id, session_id, role, content, status) VALUES (?, ?, 'assistant', '', 'processing')",
+            (payload.repository_id, payload.session_id),
         )
 
     return ChatResponseStatus(
         session_id=payload.session_id,
         status="completed",
         message="Knowledge Transfer response generated successfully.",
+        status="ready",
+        message="Chat query prepared. Dispatching to n8n from frontend.",
+        n8n_webhook_url=n8n_webhook_url,
+        n8n_payload={
+            "query": payload.query,
+            "repoUrl": repo["repository_url"],
+            "username": repo["github_username"],
+            "pat": pat,
+            "sessionId": payload.session_id,
+            "callbackUrl": callback_url,
+        },
     )
+
+
+@app.post(
+    "/api/kt/chat/complete",
+    tags=["KT Chatbot"],
+    summary="Directly complete a chat response from the frontend",
+)
+async def complete_kt_chat(payload: ChatCompleteRequest, user_id: str = Depends(get_current_user_id)) -> dict[str, str]:
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.execute(
+            """
+            UPDATE chat_messages 
+            SET content = ?, status = ?
+            WHERE id = (
+                SELECT id FROM chat_messages 
+                WHERE session_id = ? AND role = 'assistant' AND status = 'processing' 
+                ORDER BY id DESC LIMIT 1
+            )
+            """,
+            (payload.response, payload.status, payload.session_id),
+        )
+    return {"status": "ok"}
+
+
+@app.post(
+    "/api/kt/chat/fallback",
+    tags=["KT Chatbot"],
+    summary="Fallback KT response if n8n is unreachable from frontend",
+)
+async def fallback_kt_chat(payload: ChatRequest, user_id: str = Depends(get_current_user_id)) -> dict[str, str]:
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.row_factory = sqlite3.Row
+        turn_row = connection.execute(
+            "SELECT COUNT(*) as count FROM chat_messages WHERE session_id = ? AND role = 'user'",
+            (payload.session_id,),
+        ).fetchone()
+        session_turn = (turn_row["count"] - 1) if turn_row else 0
+        content = match_kt_response(payload.query, session_turn)
+        connection.execute(
+            """
+            UPDATE chat_messages 
+            SET content = ?, status = 'completed'
+            WHERE id = (
+                SELECT id FROM chat_messages 
+                WHERE session_id = ? AND role = 'assistant' AND status = 'processing' 
+                ORDER BY id DESC LIMIT 1
+            )
+            """,
+            (content, payload.session_id),
+        )
+    return {"status": "ok", "content": content}
 
 
 @app.post(

@@ -163,11 +163,64 @@ export default function KtChatPage({ onBack }) {
       // Immediately reload messages from backend for instant rendering
       const updatedList = await fetchJson(`/api/kt/chat/messages?session_id=${sessionId}`, token);
       setMessages(updatedList);
+      const dispatch = await res.json();
 
       // If it's a new session, refresh session list
       if (!selectedSessionId) {
         const list = await fetchJson(`/api/kt/chat/sessions?repository_id=${selectedRepoId}`, token);
         setSessions(list);
+      }
+
+      // Direct n8n trigger from frontend (browser)
+      if (dispatch.n8n_webhook_url && dispatch.n8n_payload) {
+        try {
+          const n8nRes = await fetch(dispatch.n8n_webhook_url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(dispatch.n8n_payload),
+          });
+
+          if (!n8nRes.ok) {
+            throw new Error(`n8n webhook responded with status ${n8nRes.status}`);
+          }
+
+          const n8nData = await n8nRes.json().catch(() => ({}));
+          // If n8n returned output directly (synchronous mode)
+          const syncOutput = n8nData?.output || n8nData?.response || (Array.isArray(n8nData) && (n8nData[0]?.output || n8nData[0]?.response));
+          if (syncOutput) {
+            await fetch('/api/kt/chat/complete', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${token}`,
+              },
+              body: JSON.stringify({
+                session_id: sessionId,
+                response: syncOutput,
+                status: 'completed',
+              }),
+            });
+            const updated = await fetchJson(`/api/kt/chat/messages?session_id=${sessionId}`, token);
+            setMessages(updated);
+          }
+          // If n8n runs asynchronously, the polling in loadMessages() will automatically pick up the completed answer when n8n calls back!
+        } catch (n8nErr) {
+          console.warn('Frontend call to n8n failed, using curated fallback:', n8nErr);
+          await fetch('/api/kt/chat/fallback', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({
+              repository_id: selectedRepoId,
+              session_id: sessionId,
+              query: query,
+            }),
+          });
+          const updated = await fetchJson(`/api/kt/chat/messages?session_id=${sessionId}`, token);
+          setMessages(updated);
+        }
       }
     } catch (err) {
       console.error(err);
