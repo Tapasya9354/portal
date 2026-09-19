@@ -908,11 +908,11 @@ async def send_kt_chat_query(payload: ChatRequest, user_id: str = Depends(get_cu
         )
 
     n8n_payload = {
+        "query": payload.query,
         "repoUrl": repo["repository_url"],
         "username": repo["github_username"],
         "pat": pat,
         "sessionId": payload.session_id,
-        "query": payload.query,
         "callbackUrl": callback_url,
     }
 
