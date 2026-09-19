@@ -8,6 +8,8 @@ services:
     container_name: pr_reviewer_backend
     ports:
       - "1806:8000"
+    extra_hosts:
+      - "n8n.nik-server.in:192.168.1.104"
     volumes:
       - /mnt/Main/PRreviewer:/data
     env_file:
