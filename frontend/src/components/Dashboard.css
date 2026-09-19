@@ -631,6 +631,34 @@
   margin-bottom: 18px;
 }
 
+.bulk-fix-panel {
+  border: 1px solid #c7d2fe;
+  background: #eef2ff;
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.bulk-fix-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 13px;
+}
+
+.bulk-fix-header p {
+  margin: 4px 0 0;
+}
+
+.bulk-fix-panel .fix-panel {
+  border-top-color: #c7d2fe;
+}
+
 .empty-note {
   color: #64748b;
   font-size: 13px;

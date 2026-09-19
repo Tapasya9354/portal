@@ -265,6 +265,25 @@ class FixSuggestionRequest(BaseModel):
     body: str = Field(min_length=1, description="The review comment text to resolve.")
 
 
+class FixComment(BaseModel):
+    """One review comment included in a batched fix."""
+
+    id: str = Field(min_length=1)
+    path: str = Field(min_length=1)
+    line: int | None = None
+    severity: str = "blocker"
+    category: str = "general"
+    body: str = Field(min_length=1)
+
+
+class BulkFixRequest(BaseModel):
+    """Request one combined fix for several review comments on the same pull request."""
+
+    repository_id: int
+    pr_number: int
+    comments: list[FixComment] = Field(min_length=1, max_length=25)
+
+
 class SuggestedFile(BaseModel):
     """A full replacement file produced by the fix agent."""
 
@@ -310,6 +329,8 @@ class FixSuggestionItem(BaseModel):
     fix_pr_url: str = ""
     fix_branch: str = ""
     created_at: str = ""
+    is_bulk: bool = False
+    comment_ids: list[str] = []
     dispatch: WorkflowDispatch | None = None
 
 
@@ -442,6 +463,12 @@ def initialize_database() -> None:
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        fix_columns = {row[1] for row in connection.execute("PRAGMA table_info(fix_suggestions)")}
+        if "is_bulk" not in fix_columns:
+            connection.execute("ALTER TABLE fix_suggestions ADD COLUMN is_bulk INTEGER NOT NULL DEFAULT 0")
+        if "comment_ids_json" not in fix_columns:
+            connection.execute("ALTER TABLE fix_suggestions ADD COLUMN comment_ids_json TEXT NOT NULL DEFAULT '[]'")
 
         connection.execute("""
             CREATE TABLE IF NOT EXISTS build_checks (
@@ -1395,6 +1422,10 @@ def row_to_suggestion(row: sqlite3.Row) -> FixSuggestionItem:
         files = [SuggestedFile(**f) for f in json.loads(row["files_json"] or "[]")]
     except (json.JSONDecodeError, TypeError, ValueError):
         files = []
+    try:
+        comment_ids = [str(i) for i in json.loads(row["comment_ids_json"] or "[]")]
+    except (json.JSONDecodeError, TypeError, ValueError):
+        comment_ids = []
     return FixSuggestionItem(
         id=row["id"],
         repository_id=row["repository_id"],
@@ -1412,6 +1443,8 @@ def row_to_suggestion(row: sqlite3.Row) -> FixSuggestionItem:
         fix_pr_url=row["fix_pr_url"] or "",
         fix_branch=row["fix_branch"] or "",
         created_at=row["created_at"],
+        is_bulk=bool(row["is_bulk"]),
+        comment_ids=comment_ids or ([row["comment_id"]] if row["comment_id"] != "bulk" else []),
     )
 
 
@@ -1435,6 +1468,89 @@ def row_to_build_check(row: sqlite3.Row) -> BuildCheckItem:
     )
 
 
+SEVERITY_RANK = {"blocker": 0, "warning": 1, "suggestion": 2}
+
+
+async def create_fix_suggestion(
+    repository_id: int,
+    pr_number: int,
+    comments: list[FixComment],
+    user_id: str,
+) -> FixSuggestionItem:
+    """Register one suggestion covering the given comments and return it with its n8n dispatch."""
+    repo, pat = load_repository_for_user(repository_id, user_id)
+    owner, name = repo["full_name"].split("/", 1)
+    pr = await fetch_pull_request(owner, name, pr_number, (repo["github_username"], pat))
+    head_branch = (pr.get("head") or {}).get("ref", "")
+    head_sha = (pr.get("head") or {}).get("sha", "")
+
+    is_bulk = len(comments) > 1
+    paths = list(dict.fromkeys(c.path for c in comments))
+    categories = {c.category for c in comments}
+    top_severity = min(comments, key=lambda c: SEVERITY_RANK.get(c.severity, 3)).severity
+    summary_body = "\n\n".join(
+        f"[{c.severity.upper()}] [{c.category.upper()}] {c.path}{f':{c.line}' if c.line else ''}\n{c.body}"
+        for c in comments
+    )
+
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO fix_suggestions (
+                repository_id, pr_number, comment_id, path, line, severity, category,
+                comment_body, status, head_branch, head_sha, is_bulk, comment_ids_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?, ?, ?)
+            """,
+            (
+                repository_id,
+                pr_number,
+                "bulk" if is_bulk else comments[0].id,
+                ", ".join(paths)[:500],
+                None if is_bulk else comments[0].line,
+                top_severity,
+                categories.pop() if len(categories) == 1 else "multiple",
+                summary_body,
+                head_branch,
+                head_sha,
+                1 if is_bulk else 0,
+                json.dumps([c.id for c in comments]),
+            ),
+        )
+        suggestion_id = cursor.lastrowid
+
+    try:
+        dispatch = build_dispatch(
+            "N8N_CODE_FIX_WEBHOOK_URL",
+            {
+                "suggestionId": suggestion_id,
+                "repoUrl": repo["repository_url"],
+                "owner": owner,
+                "repo": name,
+                "fullName": repo["full_name"],
+                "prNumber": pr_number,
+                "headBranch": head_branch,
+                "headSha": head_sha,
+                "prTitle": pr.get("title", ""),
+                "prBody": pr.get("body") or "",
+                "comments": [c.model_dump() for c in comments],
+                "credentialsUrl": credentials_url_for(repo["full_name"]),
+                "callbackUrl": callback_url_for("/api/reviews/suggestions/callback"),
+            },
+        )
+    except HTTPException:
+        with sqlite3.connect(DATABASE_PATH) as connection:
+            connection.execute(
+                "UPDATE fix_suggestions SET status = 'error', explanation = ? WHERE id = ?",
+                ("The fix suggester workflow URL is not configured.", suggestion_id),
+            )
+        raise
+
+    suggestion = await get_suggestion(suggestion_id, user_id)
+    suggestion.dispatch = dispatch
+    return suggestion
+
+
 @app.post(
     "/api/reviews/suggestions",
     response_model=FixSuggestionItem,
@@ -1452,74 +1568,36 @@ async def request_fix_suggestion(
     payload: FixSuggestionRequest,
     user_id: str = Depends(get_current_user_id),
 ) -> FixSuggestionItem:
-    repo, pat = load_repository_for_user(payload.repository_id, user_id)
-    owner, name = repo["full_name"].split("/", 1)
-    pr = await fetch_pull_request(owner, name, payload.pr_number, (repo["github_username"], pat))
-    head_branch = (pr.get("head") or {}).get("ref", "")
-    head_sha = (pr.get("head") or {}).get("sha", "")
+    comment = FixComment(
+        id=payload.comment_id,
+        path=payload.path,
+        line=payload.line,
+        severity=payload.severity,
+        category=payload.category,
+        body=payload.body,
+    )
+    return await create_fix_suggestion(payload.repository_id, payload.pr_number, [comment], user_id)
 
-    with sqlite3.connect(DATABASE_PATH) as connection:
-        connection.row_factory = sqlite3.Row
-        cursor = connection.execute(
-            """
-            INSERT INTO fix_suggestions (
-                repository_id, pr_number, comment_id, path, line, severity, category,
-                comment_body, status, head_branch, head_sha
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?)
-            """,
-            (
-                payload.repository_id,
-                payload.pr_number,
-                payload.comment_id,
-                payload.path,
-                payload.line,
-                payload.severity,
-                payload.category,
-                payload.body,
-                head_branch,
-                head_sha,
-            ),
-        )
-        suggestion_id = cursor.lastrowid
 
-    try:
-        dispatch = build_dispatch(
-            "N8N_CODE_FIX_WEBHOOK_URL",
-            {
-                "suggestionId": suggestion_id,
-                "repoUrl": repo["repository_url"],
-                "owner": owner,
-                "repo": name,
-                "fullName": repo["full_name"],
-                "prNumber": payload.pr_number,
-                "headBranch": head_branch,
-                "headSha": head_sha,
-                "prTitle": pr.get("title", ""),
-                "prBody": pr.get("body") or "",
-                "comment": {
-                    "id": payload.comment_id,
-                    "path": payload.path,
-                    "line": payload.line,
-                    "severity": payload.severity,
-                    "category": payload.category,
-                    "body": payload.body,
-                },
-                "credentialsUrl": credentials_url_for(repo["full_name"]),
-                "callbackUrl": callback_url_for("/api/reviews/suggestions/callback"),
-            },
-        )
-    except HTTPException:
-        with sqlite3.connect(DATABASE_PATH) as connection:
-            connection.execute(
-                "UPDATE fix_suggestions SET status = 'error', explanation = ? WHERE id = ?",
-                ("The fix suggester workflow URL is not configured.", suggestion_id),
-            )
-        raise
-
-    suggestion = await get_suggestion(suggestion_id, user_id)
-    suggestion.dispatch = dispatch
-    return suggestion
+@app.post(
+    "/api/reviews/suggestions/bulk",
+    response_model=FixSuggestionItem,
+    status_code=202,
+    tags=["Fix Suggestions"],
+    summary="Generate one combined fix for several review comments",
+    description="Resolves every supplied comment in a single patch so one approval opens one pull request.",
+    response_description="A pending suggestion covering all supplied comments.",
+    responses={
+        404: {"description": "Repository not found."},
+        502: {"description": "GitHub or n8n could not be reached."},
+        503: {"description": "N8N_CODE_FIX_WEBHOOK_URL is not configured."},
+    },
+)
+async def request_bulk_fix_suggestion(
+    payload: BulkFixRequest,
+    user_id: str = Depends(get_current_user_id),
+) -> FixSuggestionItem:
+    return await create_fix_suggestion(payload.repository_id, payload.pr_number, payload.comments, user_id)
 
 
 def is_safe_repo_path(path: str) -> bool:
@@ -1669,6 +1747,7 @@ async def approve_fix_suggestion(
                 }
                 if existing.status_code == 200:
                     body["sha"] = existing.json()["sha"]
+
                 put = await client.put(
                     f"{api_root}/contents/{quote(file.path, safe='/')}",
                     headers=GITHUB_HEADERS,
@@ -1677,11 +1756,22 @@ async def approve_fix_suggestion(
                 )
                 put.raise_for_status()
 
+            if suggestion.is_bulk:
+                title = f"CodeGuards fix for #{suggestion.pr_number}: {len(suggestion.comment_ids)} review comments"
+                intro = (
+                    f"Automated patch generated by CodeGuards resolving "
+                    f"{len(suggestion.comment_ids)} review comments on #{suggestion.pr_number}."
+                )
+            else:
+                title = f"CodeGuards fix for #{suggestion.pr_number}: {suggestion.path}"
+                intro = (
+                    f"Automated fix generated by CodeGuards for a **{suggestion.severity}** "
+                    f"{suggestion.category} comment on `{suggestion.path}`"
+                    f"{f':{suggestion.line}' if suggestion.line else ''} in #{suggestion.pr_number}."
+                )
             pr_body = (
-                f"Automated fix generated by CodeGuards for a **{suggestion.severity}** "
-                f"{suggestion.category} comment on `{suggestion.path}`"
-                f"{f':{suggestion.line}' if suggestion.line else ''} in #{suggestion.pr_number}.\n\n"
-                f"> {suggestion.comment_body}\n\n"
+                f"{intro}\n\n"
+                f"### Comments addressed\n```\n{suggestion.comment_body}\n```\n\n"
                 f"### What changed\n{suggestion.explanation}\n"
             )
             pr_response = await client.post(
@@ -1689,7 +1779,7 @@ async def approve_fix_suggestion(
                 headers=GITHUB_HEADERS,
                 auth=auth,
                 json={
-                    "title": f"CodeGuards fix for #{suggestion.pr_number}: {suggestion.path}",
+                    "title": title,
                     "head": fix_branch,
                     "base": suggestion.head_branch,
                     "body": pr_body,

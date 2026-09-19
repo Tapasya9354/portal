@@ -96,11 +96,13 @@ async function triggerWorkflow(dispatch) {
   if (!res.ok) throw new Error(`The n8n workflow could not be started (${res.status}).`);
 }
 
-// One suggestion per review comment, refreshed until the fix agent finishes.
+// One suggestion per review comment, plus one combined "fix everything" suggestion per PR.
 function useFixSuggestions(repoId, prNumber, enabled) {
   const { getToken } = useAuth();
   const [byComment, setByComment] = useState({});
+  const [bulk, setBulk] = useState(null);
   const [busyComment, setBusyComment] = useState('');
+  const [busyBulk, setBusyBulk] = useState(false);
   const [error, setError] = useState('');
 
   const refresh = useCallback(async () => {
@@ -112,9 +114,11 @@ function useFixSuggestions(repoId, prNumber, enabled) {
     // The API returns newest first, so the first entry per comment is the current one.
     const map = {};
     for (const item of list) {
+      if (item.is_bulk) continue;
       if (!map[item.comment_id]) map[item.comment_id] = item;
     }
     setByComment(map);
+    setBulk(list.find((item) => item.is_bulk) || null);
   }, [getToken, repoId, prNumber]);
 
   useEffect(() => {
@@ -130,12 +134,14 @@ function useFixSuggestions(repoId, prNumber, enabled) {
 
   useEffect(() => {
     if (!enabled) return undefined;
-    if (!Object.values(byComment).some((s) => s.status === 'processing')) return undefined;
+    const pending =
+      bulk?.status === 'processing' || Object.values(byComment).some((s) => s.status === 'processing');
+    if (!pending) return undefined;
     const timer = setTimeout(() => {
       refresh().catch(() => {});
     }, POLL_INTERVAL_MS);
     return () => clearTimeout(timer);
-  }, [enabled, byComment, refresh]);
+  }, [enabled, byComment, bulk, refresh]);
 
   const requestFix = useCallback(
     async (comment) => {
@@ -164,24 +170,56 @@ function useFixSuggestions(repoId, prNumber, enabled) {
     [getToken, repoId, prNumber],
   );
 
-  const approveFix = useCallback(
-    async (suggestion) => {
+  const requestBulkFix = useCallback(
+    async (comments) => {
       setError('');
-      setBusyComment(suggestion.comment_id);
+      setBusyBulk(true);
       try {
         const token = await getToken();
-        const applied = await postJson(`/api/reviews/suggestions/${suggestion.id}/approve`, token);
-        setByComment((current) => ({ ...current, [applied.comment_id]: applied }));
+        const suggestion = await postJson('/api/reviews/suggestions/bulk', token, {
+          repository_id: repoId,
+          pr_number: prNumber,
+          comments: comments.map((c) => ({
+            id: c.id,
+            path: c.path,
+            line: c.line ?? null,
+            severity: c.severity,
+            category: c.category,
+            body: c.body,
+          })),
+        });
+        setBulk(suggestion);
+        await triggerWorkflow(suggestion.dispatch);
       } catch (err) {
         setError(err.message);
       } finally {
+        setBusyBulk(false);
+      }
+    },
+    [getToken, repoId, prNumber],
+  );
+
+  const approveFix = useCallback(
+    async (suggestion) => {
+      setError('');
+      if (suggestion.is_bulk) setBusyBulk(true);
+      else setBusyComment(suggestion.comment_id);
+      try {
+        const token = await getToken();
+        const applied = await postJson(`/api/reviews/suggestions/${suggestion.id}/approve`, token);
+        if (applied.is_bulk) setBulk(applied);
+        else setByComment((current) => ({ ...current, [applied.comment_id]: applied }));
+      } catch (err) {
+        setError(err.message);
+      } finally {
+        setBusyBulk(false);
         setBusyComment('');
       }
     },
     [getToken],
   );
 
-  return { byComment, busyComment, error, requestFix, approveFix };
+  return { byComment, bulk, busyComment, busyBulk, error, requestFix, requestBulkFix, approveFix };
 }
 
 function useBuildCheck(repoId, prNumber, enabled) {
@@ -468,6 +506,51 @@ function FixSuggestionPanel({ comment, suggestion, busy, onRequest, onApprove })
   );
 }
 
+// One click: patch every priority comment on the PR and open a single pull request.
+function BulkFixPanel({ comments, headBranch, suggestion, busy, onRequest, onApprove }) {
+  if (comments.length === 0) return null;
+
+  const label = `⚡ Fix all ${comments.length} priority comment${comments.length === 1 ? '' : 's'}`;
+  const start = () => onRequest(comments);
+
+  return (
+    <div className="bulk-fix-panel">
+      <div className="bulk-fix-header">
+        <div>
+          <strong>Global fix</strong>
+          <p className="empty-note">
+            Generate one patch that resolves every blocker on this PR, then open a single pull request into{' '}
+            <code>{headBranch}</code>.
+          </p>
+        </div>
+        {(!suggestion || suggestion.status === 'empty' || suggestion.status === 'error') && (
+          <button type="button" className="primary-button small" disabled={busy} onClick={start}>
+            {busy ? 'Starting…' : suggestion ? 'Try again' : label}
+          </button>
+        )}
+      </div>
+
+      {suggestion?.status === 'processing' && (
+        <p className="fix-panel-status">⏳ The fix agent is patching {comments.length} comments in one pass…</p>
+      )}
+      {(suggestion?.status === 'empty' || suggestion?.status === 'error') && (
+        <p className="fix-panel-status">
+          {suggestion.explanation || 'The fix agent could not produce a combined patch.'}
+        </p>
+      )}
+      {(suggestion?.status === 'completed' || suggestion?.status === 'applied') && (
+        <FixSuggestionPanel
+          comment={comments}
+          suggestion={suggestion}
+          busy={busy}
+          onRequest={start}
+          onApprove={onApprove}
+        />
+      )}
+    </div>
+  );
+}
+
 function CommentCard({ comment, showAgent, fix }) {
   return (
     <li className={`comment-card comment-card-${comment.severity}`}>
@@ -651,7 +734,7 @@ function PrCard({ pr, isOpen, onToggle }) {
   }, [pr]);
   const counts = severityCounts(pr.comments);
   const fixes = useFixSuggestions(pr.repoId, pr.number, isOpen);
-
+  const priorityComments = useMemo(() => pr.comments.filter((c) => c.severity === 'blocker'), [pr]);
 
   return (
     <div className="pr-card">
@@ -685,6 +768,15 @@ function PrCard({ pr, isOpen, onToggle }) {
           </div>
 
           <BuildCheckPanel repoId={pr.repoId} prNumber={pr.number} enabled={isOpen} />
+
+          <BulkFixPanel
+            comments={priorityComments}
+            headBranch={pr.branch}
+            suggestion={fixes.bulk}
+            busy={fixes.busyBulk}
+            onRequest={fixes.requestBulkFix}
+            onApprove={fixes.approveFix}
+          />
 
           {pr.comments.length === 0 ? (
             <p className="empty-note">No AI review comments have been posted on this PR yet.</p>
@@ -839,6 +931,14 @@ function HighPriorityPrGroup({ pr, comments }) {
       <a className="pr-link" href={pr.url} target="_blank" rel="noreferrer">
         {pr.repo} #{pr.number} — {pr.title} ↗
       </a>
+      <BulkFixPanel
+        comments={comments}
+        headBranch={pr.branch}
+        suggestion={fixes.bulk}
+        busy={fixes.busyBulk}
+        onRequest={fixes.requestBulkFix}
+        onApprove={fixes.approveFix}
+      />
       <ul className="comment-list">
         {comments.map((comment) => (
           <CommentCard
