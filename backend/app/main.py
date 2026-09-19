@@ -1206,8 +1206,6 @@ def match_kt_response(query: str, session_turn: int) -> str:
     response_model=ChatResponseStatus,
     status_code=202,
     tags=["KT Chatbot"],
-    summary="Ask a question to the KT Chatbot",
-    response_description="Returns acknowledgement that the query is dispatched for asynchronous processing.",
     summary="Prepare and dispatch a question to the KT Chatbot",
     response_description="Returns n8n dispatch payload for the frontend to call directly.",
     responses={
@@ -1223,7 +1221,6 @@ async def send_kt_chat_query(payload: ChatRequest, user_id: str = Depends(get_cu
     with sqlite3.connect(DATABASE_PATH) as connection:
         connection.row_factory = sqlite3.Row
         repo = connection.execute(
-            "SELECT id, repository_url, github_username FROM repositories WHERE id = ? AND clerk_user_id = ?",
             "SELECT id, repository_url, github_username, app_password_encrypted FROM repositories WHERE id = ? AND clerk_user_id = ?",
             (payload.repository_id, user_id),
         ).fetchone()
@@ -1231,12 +1228,6 @@ async def send_kt_chat_query(payload: ChatRequest, user_id: str = Depends(get_cu
         if not repo:
             raise HTTPException(status_code=404, detail="Repository not found.")
 
-        # Determine conversation turn for this session
-        turn_row = connection.execute(
-            "SELECT COUNT(*) as count FROM chat_messages WHERE session_id = ? AND role = 'user'",
-            (payload.session_id,),
-        ).fetchone()
-        session_turn = turn_row["count"] if turn_row else 0
         pat = ""
         if repo["app_password_encrypted"]:
             try:
@@ -1250,22 +1241,14 @@ async def send_kt_chat_query(payload: ChatRequest, user_id: str = Depends(get_cu
             (payload.repository_id, payload.session_id, payload.query),
         )
 
-        # Generate curated KT response based on query keywords or sequential turn
-        assistant_content = match_kt_response(payload.query, session_turn)
-
-        # Save assistant message immediately as completed
         # Create pending assistant placeholder
         connection.execute(
-            "INSERT INTO chat_messages (repository_id, session_id, role, content, status) VALUES (?, ?, 'assistant', ?, 'completed')",
-            (payload.repository_id, payload.session_id, assistant_content),
             "INSERT INTO chat_messages (repository_id, session_id, role, content, status) VALUES (?, ?, 'assistant', '', 'processing')",
             (payload.repository_id, payload.session_id),
         )
 
     return ChatResponseStatus(
         session_id=payload.session_id,
-        status="completed",
-        message="Knowledge Transfer response generated successfully.",
         status="ready",
         message="Chat query prepared. Dispatching to n8n from frontend.",
         n8n_webhook_url=n8n_webhook_url,
