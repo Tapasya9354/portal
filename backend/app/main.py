@@ -867,7 +867,7 @@ async def get_repository_credentials(
         503: {"description": "N8N_KT_CHAT_WEBHOOK_URL not configured."},
     },
 )
-async def send_kt_chat_query(payload: ChatRequest) -> ChatResponseStatus:
+async def send_kt_chat_query(payload: ChatRequest, user_id: str = Depends(get_current_user_id)) -> ChatResponseStatus:
     n8n_webhook_url = os.getenv("N8N_KT_CHAT_WEBHOOK_URL")
     if not n8n_webhook_url:
         raise HTTPException(status_code=503, detail="N8N_KT_CHAT_WEBHOOK_URL is not configured.")
@@ -878,8 +878,8 @@ async def send_kt_chat_query(payload: ChatRequest) -> ChatResponseStatus:
     with sqlite3.connect(DATABASE_PATH) as connection:
         connection.row_factory = sqlite3.Row
         repo = connection.execute(
-            "SELECT id, repository_url, github_username, app_password_encrypted FROM repositories WHERE id = ?",
-            (payload.repository_id,),
+            "SELECT id, repository_url, github_username, app_password_encrypted FROM repositories WHERE id = ? AND clerk_user_id = ?",
+            (payload.repository_id, user_id),
         ).fetchone()
 
         if not repo:
@@ -965,12 +965,19 @@ async def kt_chat_callback(callback: ChatCallback) -> dict[str, str]:
     summary="Get chat history for a session",
     response_description="Returns the list of messages in this session.",
 )
-async def get_chat_messages(session_id: str) -> list[ChatMessageItem]:
+async def get_chat_messages(session_id: str, user_id: str = Depends(get_current_user_id)) -> list[ChatMessageItem]:
     with sqlite3.connect(DATABASE_PATH) as connection:
         connection.row_factory = sqlite3.Row
+        # Verify ownership by joining with repositories
         rows = connection.execute(
-            "SELECT id, repository_id, session_id, role, content, status, created_at FROM chat_messages WHERE session_id = ? ORDER BY id ASC",
-            (session_id,),
+            """
+            SELECT c.id, c.repository_id, c.session_id, c.role, c.content, c.status, c.created_at
+            FROM chat_messages c
+            JOIN repositories r ON c.repository_id = r.id
+            WHERE c.session_id = ? AND r.clerk_user_id = ?
+            ORDER BY c.id ASC
+            """,
+            (session_id, user_id),
         ).fetchall()
         return [
             ChatMessageItem(
@@ -993,9 +1000,15 @@ async def get_chat_messages(session_id: str) -> list[ChatMessageItem]:
     summary="List all chat sessions for a repository",
     response_description="Returns distinct chat session threads with initial prompts.",
 )
-async def list_chat_sessions(repository_id: int) -> list[ChatSessionItem]:
+async def list_chat_sessions(repository_id: int, user_id: str = Depends(get_current_user_id)) -> list[ChatSessionItem]:
     with sqlite3.connect(DATABASE_PATH) as connection:
         connection.row_factory = sqlite3.Row
+        
+        # Check ownership
+        repo = connection.execute("SELECT id FROM repositories WHERE id = ? AND clerk_user_id = ?", (repository_id, user_id)).fetchone()
+        if not repo:
+            raise HTTPException(status_code=404, detail="Repository not found.")
+
         rows = connection.execute(
             """
             SELECT session_id, content AS first_query, MIN(created_at) AS created_at
