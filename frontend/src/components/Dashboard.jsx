@@ -85,6 +85,17 @@ async function errorDetail(res, url) {
 
 const POLL_INTERVAL_MS = 4000;
 
+// The backend registers the job and hands back the n8n webhook address; the browser starts the run.
+async function triggerWorkflow(dispatch) {
+  if (!dispatch?.url) return;
+  const res = await fetch(dispatch.url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(dispatch.payload),
+  });
+  if (!res.ok) throw new Error(`The n8n workflow could not be started (${res.status}).`);
+}
+
 // One suggestion per review comment, refreshed until the fix agent finishes.
 function useFixSuggestions(repoId, prNumber, enabled) {
   const { getToken } = useAuth();
@@ -143,6 +154,7 @@ function useFixSuggestions(repoId, prNumber, enabled) {
           body: comment.body,
         });
         setByComment((current) => ({ ...current, [comment.id]: suggestion }));
+        await triggerWorkflow(suggestion.dispatch);
       } catch (err) {
         setError(err.message);
       } finally {
@@ -207,7 +219,12 @@ function useBuildCheck(repoId, prNumber, enabled) {
     setRunning(true);
     try {
       const token = await getToken();
-      setCheck(await postJson('/api/reviews/build-check', token, { repository_id: repoId, pr_number: prNumber }));
+      const started = await postJson('/api/reviews/build-check', token, {
+        repository_id: repoId,
+        pr_number: prNumber,
+      });
+      setCheck(started);
+      await triggerWorkflow(started.dispatch);
     } catch (err) {
       setError(err.message);
     } finally {

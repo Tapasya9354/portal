@@ -281,6 +281,16 @@ class FixSuggestionCallback(BaseModel):
     files: list[SuggestedFile] = []
 
 
+class WorkflowDispatch(BaseModel):
+    """Everything the browser needs to POST the job straight to the n8n webhook.
+
+    No GitHub token is included: the workflow fetches it from the internal credentials endpoint.
+    """
+
+    url: str
+    payload: dict
+
+
 class FixSuggestionItem(BaseModel):
     """A generated fix suggestion and, once approved, the PR that applies it."""
 
@@ -300,6 +310,7 @@ class FixSuggestionItem(BaseModel):
     fix_pr_url: str = ""
     fix_branch: str = ""
     created_at: str = ""
+    dispatch: WorkflowDispatch | None = None
 
 
 class BuildCheckRequest(BaseModel):
@@ -344,6 +355,7 @@ class BuildCheckItem(BaseModel):
     issues: list[BuildIssue] = []
     head_sha: str = ""
     created_at: str = ""
+    dispatch: WorkflowDispatch | None = None
 
 
 DATABASE_PATH = Path(os.getenv("SQLITE_DATABASE", Path(__file__).resolve().parents[1] / "pr_reviewer.db"))
@@ -1361,21 +1373,21 @@ async def fetch_pull_request(owner: str, name: str, number: int, auth: tuple[str
         raise HTTPException(status_code=502, detail="GitHub could not be reached.") from exc
 
 
-async def dispatch_to_n8n(env_var: str, payload: dict) -> None:
+def build_dispatch(env_var: str, payload: dict) -> WorkflowDispatch:
+    """The browser posts these jobs to n8n directly, so the backend only hands over the address."""
     webhook_url = os.getenv(env_var)
     if not webhook_url:
         raise HTTPException(status_code=503, detail=f"{env_var} is not configured.")
-    try:
-        async with httpx.AsyncClient(timeout=15, verify=False) as client:
-            response = await client.post(webhook_url, json=payload)
-            response.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to trigger the n8n workflow: {exc}") from exc
+    return WorkflowDispatch(url=webhook_url, payload=payload)
 
 
 def callback_url_for(path: str) -> str:
     backend_base = os.getenv("BACKEND_BASE_URL", "http://192.168.1.104:1806").rstrip("/")
     return f"{backend_base}{path}"
+
+
+def credentials_url_for(full_name: str) -> str:
+    return callback_url_for(f"/api/repositories/credentials?full_name={quote(full_name, safe='')}")
 
 
 def row_to_suggestion(row: sqlite3.Row) -> FixSuggestionItem:
@@ -1472,15 +1484,14 @@ async def request_fix_suggestion(
         suggestion_id = cursor.lastrowid
 
     try:
-        await dispatch_to_n8n(
+        dispatch = build_dispatch(
             "N8N_CODE_FIX_WEBHOOK_URL",
             {
                 "suggestionId": suggestion_id,
                 "repoUrl": repo["repository_url"],
                 "owner": owner,
                 "repo": name,
-                "username": repo["github_username"],
-                "pat": pat,
+                "fullName": repo["full_name"],
                 "prNumber": payload.pr_number,
                 "headBranch": head_branch,
                 "headSha": head_sha,
@@ -1494,6 +1505,7 @@ async def request_fix_suggestion(
                     "category": payload.category,
                     "body": payload.body,
                 },
+                "credentialsUrl": credentials_url_for(repo["full_name"]),
                 "callbackUrl": callback_url_for("/api/reviews/suggestions/callback"),
             },
         )
@@ -1501,11 +1513,13 @@ async def request_fix_suggestion(
         with sqlite3.connect(DATABASE_PATH) as connection:
             connection.execute(
                 "UPDATE fix_suggestions SET status = 'error', explanation = ? WHERE id = ?",
-                ("The fix suggester workflow could not be triggered.", suggestion_id),
+                ("The fix suggester workflow URL is not configured.", suggestion_id),
             )
         raise
 
-    return await get_suggestion(suggestion_id, user_id)
+    suggestion = await get_suggestion(suggestion_id, user_id)
+    suggestion.dispatch = dispatch
+    return suggestion
 
 
 def is_safe_repo_path(path: str) -> bool:
@@ -1743,18 +1757,18 @@ async def request_build_check(
         build_check_id = cursor.lastrowid
 
     try:
-        await dispatch_to_n8n(
+        dispatch = build_dispatch(
             "N8N_BUILD_CHECK_WEBHOOK_URL",
             {
                 "buildCheckId": build_check_id,
                 "repoUrl": repo["repository_url"],
                 "owner": owner,
                 "repo": name,
-                "username": repo["github_username"],
-                "pat": pat,
+                "fullName": repo["full_name"],
                 "prNumber": payload.pr_number,
                 "headBranch": head_branch,
                 "headSha": head_sha,
+                "credentialsUrl": credentials_url_for(repo["full_name"]),
                 "callbackUrl": callback_url_for("/api/reviews/build-check/callback"),
             },
         )
@@ -1762,11 +1776,14 @@ async def request_build_check(
         with sqlite3.connect(DATABASE_PATH) as connection:
             connection.execute(
                 "UPDATE build_checks SET status = 'error', summary = ? WHERE id = ?",
-                ("The build validator workflow could not be triggered.", build_check_id),
+                ("The build validator workflow URL is not configured.", build_check_id),
             )
         raise
 
-    return await read_build_check(payload.repository_id, payload.pr_number, user_id)
+    check = await read_build_check(payload.repository_id, payload.pr_number, user_id)
+    if check:
+        check.dispatch = dispatch
+    return check
 
 
 @app.post(
