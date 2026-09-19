@@ -20,8 +20,6 @@ services:
       - ./backend/.env
     environment:
       - SQLITE_DATABASE=/data/pr_reviewer.db
-      - N8N_KT_CHAT_WEBHOOK_URL=http://host.docker.internal:5678/webhook/kt-chatbot
-      - N8N_PR_REVIEW_WEBHOOK_URL=http://host.docker.internal:5678/webhook/pr-review
     restart: unless-stopped
 
   frontend:

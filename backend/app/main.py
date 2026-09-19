@@ -920,7 +920,6 @@ async def send_kt_chat_query(payload: ChatRequest, user_id: str = Depends(get_cu
 
     try:
         async with httpx.AsyncClient(timeout=10, verify=False) as client:
-        async with httpx.AsyncClient(timeout=10) as client:
             response = await client.post(n8n_webhook_url, json=n8n_payload)
             response.raise_for_status()
     except httpx.HTTPError as exc:
