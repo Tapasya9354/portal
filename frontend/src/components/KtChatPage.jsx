@@ -78,6 +78,9 @@ export default function KtChatPage({ onBack }) {
   }, [selectedRepoId, getToken]);
 
   // Load & Poll Messages
+  const hasProcessing = messages.some(m => m.status === 'processing');
+
+  // Load messages when selectedSessionId changes
   useEffect(() => {
     if (!selectedSessionId) {
       setMessages([]);
@@ -91,11 +94,32 @@ export default function KtChatPage({ onBack }) {
       try {
         const token = await getToken();
         const list = await fetchJson(`/api/kt/chat/messages?session_id=${selectedSessionId}`, token);
+        if (!cancelled) setMessages(list);
+      } catch (e) {
+        console.error(e);
+      }
+    }
+    
+    loadMessages();
+    return () => { cancelled = true; };
+  }, [selectedSessionId, getToken]);
+
+  // Reactive polling: runs every 1.5s whenever there is a message with status === 'processing'
+  useEffect(() => {
+    if (!selectedSessionId || !hasProcessing) return;
+
+    let cancelled = false;
+    const interval = setInterval(async () => {
+      try {
+        const token = await getToken();
+        const list = await fetchJson(`/api/kt/chat/messages?session_id=${selectedSessionId}`, token);
         if (!cancelled) {
           setMessages(list);
           const isProcessing = list.some(m => m.status === 'processing');
           if (isProcessing) {
             timer = setTimeout(loadMessages, 3000);
+          if (!list.some(m => m.status === 'processing')) {
+            clearInterval(interval);
           }
         }
       } catch (e) {
@@ -105,11 +129,15 @@ export default function KtChatPage({ onBack }) {
     
     loadMessages();
     
+    }, 1500);
+
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
+      clearInterval(interval);
     };
   }, [selectedSessionId, getToken]);
+  }, [selectedSessionId, hasProcessing, getToken]);
 
   // Auto-scroll to bottom of chat
   useEffect(() => {
@@ -204,6 +232,7 @@ export default function KtChatPage({ onBack }) {
             setMessages(updated);
           }
           // If n8n runs asynchronously, the polling in loadMessages() will automatically pick up the completed answer when n8n calls back!
+          // If n8n runs asynchronously, the reactive polling will automatically pick up the completed answer as soon as n8n calls back!
         } catch (n8nErr) {
           console.warn('Frontend call to n8n failed, using curated fallback:', n8nErr);
           await fetch('/api/kt/chat/fallback', {
