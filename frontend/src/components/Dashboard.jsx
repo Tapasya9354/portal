@@ -501,7 +501,7 @@ const TABS = [
   { id: 'high-priority', label: 'High Priority' },
 ];
 
-export default function Dashboard({ onManageRepos }) {
+export default function Dashboard({ onManageRepos, onOpenChat }) {
   const { getToken } = useAuth();
   const [activeTab, setActiveTab] = useState('overview');
   const [openPrId, setOpenPrId] = useState(null);
@@ -523,6 +523,9 @@ export default function Dashboard({ onManageRepos }) {
           {onManageRepos && (
             <button className="secondary-button" type="button" onClick={onManageRepos}>
               Manage repositories
+            </button>
+            <button className="primary-button" type="button" onClick={onOpenChat} style={{ marginLeft: '12px' }}>
+              Ask AI
             </button>
           )}
           <UserButton afterSignOutUrl="/" />

@@ -1,0 +1,225 @@
+.kt-layout {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  background-color: #f8fafc;
+}
+
+.kt-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 24px;
+  background-color: white;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.kt-header-left {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.kt-header h1 {
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: #0f172a;
+  margin: 0;
+}
+
+.kt-content {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+.kt-sidebar {
+  width: 300px;
+  background-color: white;
+  border-right: 1px solid #e2e8f0;
+  padding: 20px;
+  overflow-y: auto;
+}
+
+.kt-sidebar h3 {
+  font-size: 0.875rem;
+  text-transform: uppercase;
+  color: #64748b;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  margin-bottom: 12px;
+}
+
+.mt-6 { margin-top: 24px; }
+.mb-4 { margin-bottom: 16px; }
+.w-full { width: 100%; }
+
+.kt-repo-list, .kt-session-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.kt-repo-list li, .kt-session-list li {
+  padding: 10px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: #334155;
+  font-size: 0.95rem;
+  margin-bottom: 4px;
+  transition: all 0.2s;
+}
+
+.kt-repo-list li:hover, .kt-session-list li:hover {
+  background-color: #f1f5f9;
+}
+
+.kt-repo-list li.active, .kt-session-list li.active {
+  background-color: #e0e7ff;
+  color: #4338ca;
+  font-weight: 500;
+}
+
+.kt-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  background-color: white;
+  margin: 24px;
+  border-radius: 12px;
+  box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);
+  overflow: hidden;
+}
+
+.kt-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: #64748b;
+}
+
+.kt-chat-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.kt-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.kt-message {
+  display: flex;
+  width: 100%;
+}
+
+.kt-message.user {
+  justify-content: flex-end;
+}
+
+.kt-message.assistant {
+  justify-content: flex-start;
+}
+
+.kt-message-bubble {
+  max-width: 75%;
+  padding: 12px 16px;
+  border-radius: 12px;
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
+.kt-message.user .kt-message-bubble {
+  background-color: #4f46e5;
+  color: white;
+  border-bottom-right-radius: 2px;
+}
+
+.kt-message.assistant .kt-message-bubble {
+  background-color: #f1f5f9;
+  color: #0f172a;
+  border-bottom-left-radius: 2px;
+}
+
+/* Markdown styling inside assistant bubble */
+.kt-message-bubble p {
+  margin-top: 0;
+  margin-bottom: 0.75rem;
+}
+.kt-message-bubble p:last-child {
+  margin-bottom: 0;
+}
+.kt-message-bubble pre {
+  background-color: #1e293b;
+  color: #e2e8f0;
+  padding: 12px;
+  border-radius: 6px;
+  overflow-x: auto;
+}
+.kt-message-bubble code {
+  font-family: monospace;
+  background-color: rgba(0,0,0,0.1);
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+.kt-message-bubble pre code {
+  background-color: transparent;
+  padding: 0;
+}
+
+.kt-input-form {
+  display: flex;
+  padding: 16px;
+  border-top: 1px solid #e2e8f0;
+  background-color: white;
+  gap: 12px;
+}
+
+.kt-input-form input {
+  flex: 1;
+  padding: 12px 16px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  font-size: 0.95rem;
+  outline: none;
+}
+
+.kt-input-form input:focus {
+  border-color: #4f46e5;
+  box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.2);
+}
+
+.kt-input-form input:disabled {
+  background-color: #f8fafc;
+  cursor: not-allowed;
+}
+
+.kt-loading {
+  display: flex;
+  gap: 4px;
+  padding: 4px 8px;
+}
+
+.kt-loading .dot {
+  width: 8px;
+  height: 8px;
+  background-color: #94a3b8;
+  border-radius: 50%;
+  animation: pulse 1.5s infinite ease-in-out;
+}
+
+.kt-loading .dot:nth-child(1) { animation-delay: -0.3s; }
+.kt-loading .dot:nth-child(2) { animation-delay: -0.15s; }
+
+@keyframes pulse {
+  0%, 80%, 100% { transform: scale(0.6); opacity: 0.5; }
+  40% { transform: scale(1); opacity: 1; }
+}
+
