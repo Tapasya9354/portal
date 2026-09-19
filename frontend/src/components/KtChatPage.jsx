@@ -10,6 +10,14 @@ async function fetchJson(url, token) {
   return res.json();
 }
 
+const SUGGESTIONS = [
+  { label: '🏛️ Architecture Overview', query: 'Can you give me an overview of this repository\'s architecture and main components?' },
+  { label: '🔐 Security & Auth', query: 'Where is authentication and GitHub token security handled in the backend?' },
+  { label: '📋 AI Review Rules', query: 'What architectural rules and coding standards does the AI PR Reviewer enforce?' },
+  { label: '⚡ PR Review Lifecycle', query: 'How does the PR review pipeline trigger and process a new pull request?' },
+  { label: '🚀 Developer Onboarding', query: 'Where should a new engineer start if they want to contribute to this codebase?' },
+];
+
 export default function KtChatPage({ onBack }) {
   const { getToken } = useAuth();
   
@@ -108,13 +116,14 @@ export default function KtChatPage({ onBack }) {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  const handleSend = async (e) => {
-    e.preventDefault();
-    if (!input.trim() || !selectedRepoId) return;
+  const handleSend = async (e, customQuery = null) => {
+    if (e) e.preventDefault();
+    const queryToSend = customQuery !== null ? customQuery : input;
+    if (!queryToSend.trim() || !selectedRepoId) return;
 
     const token = await getToken();
     const sessionId = selectedSessionId || 'session-' + Math.random().toString(36).substr(2, 9);
-    const query = input;
+    const query = queryToSend;
     
     setInput('');
     setIsSending(true);
@@ -142,17 +151,19 @@ export default function KtChatPage({ onBack }) {
       });
 
       if (!res.ok) {
-        // Surface the backend's actual rejection reason instead of a generic message.
         let detail = `Failed to send message (${res.status}).`;
         try {
           const body = await res.json();
           if (body?.detail) detail = body.detail;
         } catch {
-          // Response body wasn't JSON; keep the generic message.
         }
         throw new Error(detail);
       }
       
+      // Immediately reload messages from backend for instant rendering
+      const updatedList = await fetchJson(`/api/kt/chat/messages?session_id=${sessionId}`, token);
+      setMessages(updatedList);
+
       // If it's a new session, refresh session list
       if (!selectedSessionId) {
         const list = await fetchJson(`/api/kt/chat/sessions?repository_id=${selectedRepoId}`, token);
@@ -161,7 +172,6 @@ export default function KtChatPage({ onBack }) {
     } catch (err) {
       console.error(err);
       alert(err.message);
-      // Stop the placeholder bubble from spinning forever when the request never made it to n8n.
       setMessages(prev => prev.map(m => (
         m.role === 'assistant' && m.status === 'processing'
           ? { ...m, status: 'error', content: err.message }
@@ -233,7 +243,21 @@ export default function KtChatPage({ onBack }) {
                 {messages.length === 0 && (
                   <div className="kt-empty-state">
                     <h2>How can I help you understand this repo?</h2>
-                    <p>Try asking "What is the tech stack?" or "Where is the auth middleware?"</p>
+                    <p>Select a question below or type your own:</p>
+                    <div className="kt-empty-suggestions">
+                      {SUGGESTIONS.map((s, idx) => (
+                        <button
+                          key={idx}
+                          type="button"
+                          className="kt-empty-suggestion-card"
+                          onClick={() => handleSend(null, s.query)}
+                          disabled={isSending}
+                        >
+                          <span className="kt-suggestion-title">{s.label}</span>
+                          <span className="kt-suggestion-preview">{s.query}</span>
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 )}
                 {messages.map((m, i) => (
@@ -254,6 +278,20 @@ export default function KtChatPage({ onBack }) {
                   </div>
                 ))}
                 <div ref={messagesEndRef} />
+              </div>
+
+              <div className="kt-suggestions-bar">
+                {SUGGESTIONS.map((s, idx) => (
+                  <button 
+                    key={idx} 
+                    type="button" 
+                    className="kt-suggestion-chip"
+                    onClick={() => handleSend(null, s.query)}
+                    disabled={isSending || messages.some(m => m.status === 'processing')}
+                  >
+                    {s.label}
+                  </button>
+                ))}
               </div>
 
               <form className="kt-input-form" onSubmit={handleSend}>

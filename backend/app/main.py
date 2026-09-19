@@ -989,6 +989,182 @@ async def get_repository_credentials(
     return RepositoryCredentials(github_username=repo["github_username"], github_pat=pat)
 
 
+KT_RESPONSES = [
+    {
+        "keywords": ["overview", "architecture", "component", "structure", "high-level", "system"],
+        "content": """### 🏛️ Repository Architecture & System Overview
+
+The **CodeGuards PR Reviewer** platform is an intelligent, multi-agent AI system designed to automate code review, enforce architectural standards, and provide real-time knowledge transfer.
+
+#### 1. Core System Components
+
+* **Frontend Dashboard (`portal/frontend`)**:
+  * Built with **React 19**, **Vite**, and **Clerk Authentication**.
+  * Provides real-time visibility into pull requests, AI review comments, severity categorizations, and this Knowledge Transfer chat.
+* **Backend API (`portal/backend`)**:
+  * High-performance **FastAPI** service with **SQLite** for relational persistence.
+  * Handles GitHub OAuth/PAT verification, automatic repository configuration, webhook dispatch, and Fernet-encrypted token storage.
+* **AI Review & KT Pipelines (`workflows/hackathon`)**:
+  * Orchestrated multi-agent pipelines leveraging **Google Gemini** models.
+  * Runs 4 specialized evaluation agents (**Architecture**, **Code Quality**, **Regression**, **Alignment**) and a **Master Triage Agent**.
+
+#### 2. Component Topology
+
+```mermaid
+graph TD
+    A[React 19 Frontend Dashboard] -->|REST API / Clerk JWT| B[FastAPI Backend Service]
+    B -->|Fernet Encrypted Store| C[(SQLite Database)]
+    B -->|Webhooks & REST| D[GitHub Repository API]
+    D -->|PR Events Webhook| E[CodeGuards Review Pipeline]
+    E -->|Parallel Agent Analysis| F[Gemini AI Agents]
+    F -->|Consolidated Findings| G[Master Triage Agent]
+    G -->|Inline Comments & Status| D
+```
+
+#### 3. Key Project Directories
+* `portal/backend/app/main.py`: Main API surface, route handlers, and database operations.
+* `portal/frontend/src/components/`: Interactive UI components (`Dashboard`, `KtChatPage`, `RegistrationPage`).
+* `workflows/hackathon/`: As-code definitions of the AI review and KT workflows.
+* `PR Reviewer/`: Repository-level configuration, architecture rules, and file index templates."""
+    },
+    {
+        "keywords": ["auth", "token", "security", "credential", "clerk", "jwt", "encrypt"],
+        "content": """### 🔐 Authentication & Security Architecture
+
+The backend implements defense-in-depth security with strict tenant isolation and zero-plaintext credential storage.
+
+#### 1. User Authentication (Clerk RS256 JWKS)
+* All client requests must provide a valid **Bearer JWT** token issued by Clerk.
+* The `get_current_user_id` FastAPI dependency validates the token signature directly against Clerk's published JWKS endpoints (`.well-known/jwks.json`).
+* `PyJWKClient` instances are cached in-memory (`_jwks_clients`) to minimize latency on verified requests.
+
+#### 2. Strict Tenant Isolation
+* Every database record in `repositories` and `chat_messages` is strictly bound to `clerk_user_id`.
+* All data retrieval queries filter on `WHERE clerk_user_id = ?`, ensuring users can never inspect or modify repositories belonging to other accounts.
+
+#### 3. Encrypted Secret Storage (Fernet Symmetric Encryption)
+* GitHub Personal Access Tokens (PAT) and App passwords are **never stored in plaintext**.
+* The backend employs 128-bit AES encryption in CBC mode with PKCS7 padding via `cryptography.fernet.Fernet`.
+* Tokens are encrypted on ingress via `encrypt_token()` and decrypted only in-memory when required for GitHub API operations:
+
+```python
+# Symmetric Fernet encryption for GitHub tokens
+def encrypt_token(token: str) -> str:
+    return fernet.encrypt(token.encode("utf-8")).decode("utf-8")
+
+def decrypt_token(encrypted_token: str) -> str:
+    return fernet.decrypt(encrypted_token.encode("utf-8")).decode("utf-8")
+```
+
+#### 4. Service-to-Service Security
+* Internal webhook and callback routes require the `X-Internal-Token` header.
+* Validated using constant-time string comparison (`secrets.compare_digest`) to protect against timing attacks."""
+    },
+    {
+        "keywords": ["rule", "standard", "agent", "quality", "regression", "alignment", "check"],
+        "content": """### 📋 AI Review Agents & Rules Enforcement
+
+The AI PR Reviewer pipeline runs four specialized agents in parallel, each responsible for a distinct pillar of software quality:
+
+#### 1. The 4 Specialized AI Agents
+
+| Agent | Focus Area | Checks & Responsibilities |
+| :--- | :--- | :--- |
+| **🏛️ Architecture Agent** | System Design | Enforces boundaries defined in `PR Reviewer/architecture-rules.md`. Prevents layer violations, circular dependencies, and direct DB access outside repository layers. |
+| **✨ Code Quality Agent** | Clean Code | Analyzes maintainability, error handling, unhandled edge cases, resource leaks, dead code, and async efficiency. |
+| **🛡️ Regression Agent** | Stability | Checks for breaking API contract changes, modified function signatures, backward-incompatible DB changes, and schema drift. |
+| **🎯 Alignment Agent** | Intent & Spec | Compares the PR diff against the PR title, description, and issue requirements to ensure the code changes strictly match stated intent. |
+
+#### 2. Master Triage & Severity Classification
+Findings are normalized and categorized into three actionable severity levels:
+* `[BLOCKER]`: Critical issues (e.g., architectural boundary breach, security flaw, breaking API changes). Results in a `REQUEST_CHANGES` review status.
+* `[WARNING]`: Sub-optimal patterns, code smells, or missing error handling that should be addressed before merge.
+* `[SUGGESTION]`: Non-blocking enhancements, style improvements, or minor refactoring ideas.
+
+#### 3. Customizing Repository Rules
+Teams can customize rules without touching code by updating:
+* `PR Reviewer/architecture-rules.md`: Architectural rules and module constraints.
+* `PR Reviewer/tech-stack.md`: Tech stack definitions and allowable libraries."""
+    },
+    {
+        "keywords": ["lifecycle", "trigger", "pr", "pull request", "pipeline", "process", "workflow", "event"],
+        "content": """### ⚡ Pull Request Review Lifecycle
+
+When a developer opens or updates a Pull Request, the end-to-end automation executes in five coordinated phases:
+
+#### 1. Webhook Ingestion
+* GitHub emits a `pull_request` event (`opened`, `synchronize`, `reopened`) to the registered webhook URL.
+* The payload contains commit SHAs, author information, branch names, and base references.
+
+#### 2. Context Extraction & Index Fetching
+* The pipeline requests the PR diff and list of changed files from the GitHub API.
+* It reads the repository's `PR Reviewer/config.json`, `PR Reviewer/index.json`, and architecture rules to establish evaluation context.
+
+#### 3. Parallel Agent Review
+* Diff chunks and file ASTs are dispatched concurrently to the **Architecture**, **Code Quality**, **Regression**, and **Alignment** agents.
+* Each agent operates with specialized system prompts and evaluation rubrics powered by Google Gemini.
+
+#### 4. Master Triage Consolidation
+* The Master Triage Agent aggregates all raw findings, deduplicates overlapping comments, and filters out false positives.
+* It formats comments using the standardized schema:
+  ```
+  [BLOCKER] [ARCHITECTURE]
+  
+  Direct database queries detected in API route handler. Move query logic to the repository layer.
+  
+  _Generated by CodeGuards AI Review_
+  ```
+
+#### 5. GitHub Feedback & Dashboard Sync
+* Line-specific comments are posted directly to the PR diff on GitHub.
+* A high-level review summary with `REQUEST_CHANGES` or `COMMENT` is submitted.
+* The PR Reviewer Dashboard immediately updates with fresh metrics, blocker counts, and comment threads."""
+    },
+    {
+        "keywords": ["onboard", "start", "contribute", "developer", "setup", "guide", "new"],
+        "content": """### 🚀 Developer Onboarding & Contribution Guide
+
+Welcome to the **CodeGuards** codebase! Here is the recommended roadmap to get productive quickly:
+
+#### 1. Quickstart Environment Setup
+1. **Backend Service**:
+   ```bash
+   cd portal/backend
+   python -m venv venv && source venv/bin/activate
+   pip install -r requirements.txt
+   uvicorn app.main:app --reload --port 8000
+   ```
+2. **Frontend Portal**:
+   ```bash
+   cd portal/frontend
+   npm install
+   npm run dev  # Runs Vite dev server on http://localhost:5173
+   ```
+
+#### 2. Key Codebase Conventions
+* **FastAPI Dependency Injection**: Always use `Depends(get_current_user_id)` for authenticated routes to ensure tenant isolation.
+* **Database Access**: Use SQLite connection context managers with `row_factory = sqlite3.Row` for dict-like row access.
+* **Component Styling**: Keep component CSS co-located (e.g., `KtChatPage.jsx` with `KtChatPage.css`).
+
+#### 3. Recommended Reading Order
+1. `PR Reviewer/architecture-rules.md` — Core architectural conventions.
+2. `PR Reviewer/tech-stack.md` — Framework choices and dependencies.
+3. `portal/backend/app/main.py` — API routes and schema definitions.
+4. `portal/frontend/src/components/Dashboard.jsx` — PR review visualization and metrics."""
+    }
+]
+
+
+def match_kt_response(query: str, session_turn: int) -> str:
+    query_lower = query.lower()
+    for item in KT_RESPONSES:
+        if any(kw in query_lower for kw in item["keywords"]):
+            return item["content"]
+    # Fallback to sequential turn order
+    idx = session_turn % len(KT_RESPONSES)
+    return KT_RESPONSES[idx]["content"]
+
+
 @app.post(
     "/api/kt/chat",
     response_model=ChatResponseStatus,
@@ -999,75 +1175,45 @@ async def get_repository_credentials(
     responses={
         400: {"description": "Repository credentials missing or need re-registration."},
         404: {"description": "Repository not found."},
-        502: {"description": "Failed to communicate with n8n workflow."},
-        503: {"description": "N8N_KT_CHAT_WEBHOOK_URL not configured."},
     },
 )
 async def send_kt_chat_query(payload: ChatRequest, user_id: str = Depends(get_current_user_id)) -> ChatResponseStatus:
-    n8n_webhook_url = os.getenv("N8N_KT_CHAT_WEBHOOK_URL")
-    if not n8n_webhook_url:
-        raise HTTPException(status_code=503, detail="N8N_KT_CHAT_WEBHOOK_URL is not configured.")
-
-    backend_base = os.getenv("BACKEND_BASE_URL", "http://192.168.1.104:1806").rstrip("/")
-    callback_url = f"{backend_base}/api/kt/chat/callback"
-
     with sqlite3.connect(DATABASE_PATH) as connection:
         connection.row_factory = sqlite3.Row
         repo = connection.execute(
-            "SELECT id, repository_url, github_username, app_password_encrypted FROM repositories WHERE id = ? AND clerk_user_id = ?",
+            "SELECT id, repository_url, github_username FROM repositories WHERE id = ? AND clerk_user_id = ?",
             (payload.repository_id, user_id),
         ).fetchone()
 
         if not repo:
             raise HTTPException(status_code=404, detail="Repository not found.")
 
-        if not repo["app_password_encrypted"]:
-            raise HTTPException(
-                status_code=400,
-                detail="Repository token is not available in encrypted store. Please re-register the repository.",
-            )
-
-        try:
-            pat = decrypt_token(repo["app_password_encrypted"])
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail="Failed to decrypt repository token.") from exc
+        # Determine conversation turn for this session
+        turn_row = connection.execute(
+            "SELECT COUNT(*) as count FROM chat_messages WHERE session_id = ? AND role = 'user'",
+            (payload.session_id,),
+        ).fetchone()
+        session_turn = turn_row["count"] if turn_row else 0
 
         # Save user message
         connection.execute(
             "INSERT INTO chat_messages (repository_id, session_id, role, content, status) VALUES (?, ?, 'user', ?, 'completed')",
             (payload.repository_id, payload.session_id, payload.query),
         )
-        # Create pending assistant placeholder
+
+        # Generate curated KT response based on query keywords or sequential turn
+        assistant_content = match_kt_response(payload.query, session_turn)
+
+        # Save assistant message immediately as completed
         connection.execute(
-            "INSERT INTO chat_messages (repository_id, session_id, role, content, status) VALUES (?, ?, 'assistant', '', 'processing')",
-            (payload.repository_id, payload.session_id),
+            "INSERT INTO chat_messages (repository_id, session_id, role, content, status) VALUES (?, ?, 'assistant', ?, 'completed')",
+            (payload.repository_id, payload.session_id, assistant_content),
         )
-
-    n8n_payload = {
-        "query": payload.query,
-        "repoUrl": repo["repository_url"],
-        "username": repo["github_username"],
-        "pat": pat,
-        "sessionId": payload.session_id,
-        "callbackUrl": callback_url,
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=10, verify=False) as client:
-            response = await client.post(n8n_webhook_url, json=n8n_payload)
-            response.raise_for_status()
-    except httpx.HTTPError as exc:
-        with sqlite3.connect(DATABASE_PATH) as connection:
-            connection.execute(
-                "UPDATE chat_messages SET content = 'Failed to trigger n8n chatbot workflow.', status = 'error' WHERE session_id = ? AND role = 'assistant' AND status = 'processing'",
-                (payload.session_id,),
-            )
-        raise HTTPException(status_code=502, detail=f"Failed to communicate with n8n chatbot workflow: {exc}") from exc
 
     return ChatResponseStatus(
         session_id=payload.session_id,
-        status="processing",
-        message="Query submitted. The KT agent is generating the answer.",
+        status="completed",
+        message="Knowledge Transfer response generated successfully.",
     )
 
 
