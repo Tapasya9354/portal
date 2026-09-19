@@ -61,6 +61,17 @@ pipeline {
             }
         }
 
+        stage('Prepare Frontend Env') {
+            steps {
+                withCredentials([file(credentialsId: 'portal-frontend-env', variable: 'FRONTEND_ENV_FILE')]) {
+                    sh '''
+                        set -eux
+                        install -m 600 "$FRONTEND_ENV_FILE" frontend/.env
+                    '''
+                }
+            }
+        }
+
         stage('Deploy Prod') {
             steps {
                 sh '''
@@ -74,7 +85,7 @@ pipeline {
 
     post {
         always {
-            sh 'rm -f backend/.env || true'
+            sh 'rm -f backend/.env frontend/.env || true'
         }
     }
 }
