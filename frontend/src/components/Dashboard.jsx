@@ -217,46 +217,106 @@ function TrendChart({ data }) {
   );
 }
 
-function CommentCard({ comment }) {
+function CommentCard({ comment, showAgent }) {
   return (
     <li className={`comment-card comment-card-${comment.severity}`}>
       <div className="comment-card-header">
         <PriorityBadge severity={comment.severity} />
+        {showAgent && (
+          <span className="comment-agent">
+            <span className="agent-dot" style={{ background: AGENT_COLOR[comment.category] || '#64748b' }} />
+            {agentForCategory(comment.category)}
+          </span>
+        )}
         <span className="comment-path">
           {comment.path}
           {typeof comment.line === 'number' ? `:${comment.line}` : ''}
         </span>
       </div>
       <p className="comment-body">{comment.body}</p>
+      {comment.html_url && (
+        <a className="pr-link" href={comment.html_url} target="_blank" rel="noreferrer">
+          View comment on GitHub ↗
+        </a>
+      )}
     </li>
   );
 }
 
-function AgentColumns({ comments }) {
-  const grouped = categoryOrder
-    .map((category) => ({ category, items: comments.filter((c) => c.category === category) }))
-    .filter((g) => g.items.length > 0);
+const FINAL_TAB_ID = 'final';
 
-  if (grouped.length === 0) {
-    return <p className="empty-note">No comments from any agent on this PR.</p>;
-  }
+// Per-PR tabs: one tab per review agent plus the master triage result posted on the PR.
+function PrCommentTabs({ pr, sortedComments }) {
+  const [activeTab, setActiveTab] = useState(categoryOrder[0]);
+
+  // The triage agent can emit a category outside the four known agents; keep those visible too.
+  const categories = useMemo(() => {
+    const extra = sortedComments.map((c) => c.category).filter((c) => c && !categoryOrder.includes(c));
+    return [...categoryOrder, ...new Set(extra)];
+  }, [sortedComments]);
+
+  const byCategory = useMemo(
+    () =>
+      Object.fromEntries(
+        categories.map((category) => [category, sortedComments.filter((c) => c.category === category)]),
+      ),
+    [categories, sortedComments],
+  );
+  const shortlisted = useMemo(
+    () => sortedComments.filter((c) => c.severity === 'blocker'),
+    [sortedComments],
+  );
+
+  const activeComments = activeTab === FINAL_TAB_ID ? shortlisted : byCategory[activeTab] || [];
 
   return (
-    <div className="agent-columns">
-      {grouped.map((g) => (
-        <div className="agent-column" key={g.category}>
-          <div className="agent-column-header" style={{ borderColor: AGENT_COLOR[g.category] }}>
-            <span className="agent-dot" style={{ background: AGENT_COLOR[g.category] }} />
-            <span>{agentForCategory(g.category)}</span>
-            <span className="agent-column-count">{g.items.length}</span>
-          </div>
-          <ul className="comment-list">
-            {g.items.map((comment) => (
-              <CommentCard key={comment.id} comment={comment} />
-            ))}
-          </ul>
+    <div className="pr-comment-tabs">
+      <nav className="agent-tabs">
+        {categories.map((category) => (
+          <button
+            key={category}
+            type="button"
+            className={`agent-tab ${activeTab === category ? 'agent-tab-active' : ''}`}
+            style={activeTab === category ? { borderBottomColor: AGENT_COLOR[category] || '#2563eb' } : undefined}
+            onClick={() => setActiveTab(category)}
+          >
+            <span className="agent-dot" style={{ background: AGENT_COLOR[category] || '#64748b' }} />
+            {agentForCategory(category)}
+            <span className="agent-tab-count">{byCategory[category].length}</span>
+          </button>
+        ))}
+        <button
+          type="button"
+          className={`agent-tab agent-tab-final ${activeTab === FINAL_TAB_ID ? 'agent-tab-active' : ''}`}
+          onClick={() => setActiveTab(FINAL_TAB_ID)}
+        >
+          🔴 Final review
+          <span className="agent-tab-count">{shortlisted.length}</span>
+        </button>
+      </nav>
+
+      {activeTab === FINAL_TAB_ID && (
+        <div className="final-review-panel">
+          <p className="tab-intro">
+            High priority findings shortlisted by the Master Triage Agent and posted on this pull request.
+          </p>
+          {pr.summary && <p className="pr-summary-text">{pr.summary}</p>}
         </div>
-      ))}
+      )}
+
+      {activeComments.length === 0 ? (
+        <p className="empty-note">
+          {activeTab === FINAL_TAB_ID
+            ? 'No blocker-level comments were shortlisted for this PR.'
+            : `No comments from the ${agentForCategory(activeTab)} on this PR.`}
+        </p>
+      ) : (
+        <ul className="comment-list">
+          {activeComments.map((comment) => (
+            <CommentCard key={comment.id} comment={comment} showAgent={activeTab === FINAL_TAB_ID} />
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
@@ -267,7 +327,6 @@ function PrCard({ pr, isOpen, onToggle }) {
     return [...pr.comments].sort((a, b) => rank[a.severity] - rank[b.severity]);
   }, [pr]);
   const counts = severityCounts(pr.comments);
-  const highPriority = pr.comments.filter((c) => c.severity === 'blocker');
 
   return (
     <div className="pr-card">
@@ -294,29 +353,16 @@ function PrCard({ pr, isOpen, onToggle }) {
 
       {isOpen && (
         <div className="pr-card-body">
-          {pr.summary && <p className="pr-summary-text">{pr.summary}</p>}
           <div className="pr-card-actions">
             <a className="pr-link" href={pr.url} target="_blank" rel="noreferrer">
               View on GitHub ↗
             </a>
           </div>
 
-          {highPriority.length > 0 && (
-            <div className="high-priority-inline">
-              <h4>🔴 High priority ({highPriority.length})</h4>
-              <ul className="comment-list">
-                {highPriority.map((c) => (
-                  <CommentCard key={c.id} comment={c} />
-                ))}
-              </ul>
-            </div>
-          )}
-
-          <h4>Comments by agent</h4>
           {pr.comments.length === 0 ? (
             <p className="empty-note">No AI review comments have been posted on this PR yet.</p>
           ) : (
-            <AgentColumns comments={sortedComments} />
+            <PrCommentTabs pr={pr} sortedComments={sortedComments} />
           )}
         </div>
       )}

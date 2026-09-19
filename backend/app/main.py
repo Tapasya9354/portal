@@ -487,6 +487,10 @@ REVIEW_COMMENT_PATTERN = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+# The pipeline posts reviews from a dedicated reviewer account, not the registered repo user,
+# so CodeGuards output is recognised by this marker rather than by comment author.
+CODEGUARDS_REVIEW_MARKER = "codeguards ai review"
+
 
 def parse_review_comment_body(body: str) -> tuple[str, str, str] | None:
     match = REVIEW_COMMENT_PATTERN.match((body or "").strip())
@@ -560,8 +564,6 @@ async def build_repository_reviews(repo_row: sqlite3.Row) -> RepositoryReviews:
 
                 comments: list[ReviewComment] = []
                 for raw in raw_comments:
-                    if (raw.get("user") or {}).get("login", "").lower() != username.lower():
-                        continue
                     parsed = parse_review_comment_body(raw.get("body"))
                     if not parsed:
                         continue
@@ -581,7 +583,7 @@ async def build_repository_reviews(repo_row: sqlite3.Row) -> RepositoryReviews:
 
                 bot_reviews = [
                     r for r in raw_reviews
-                    if (r.get("user") or {}).get("login", "").lower() == username.lower() and r.get("body")
+                    if CODEGUARDS_REVIEW_MARKER in (r.get("body") or "").lower()
                 ]
                 latest_review = bot_reviews[-1] if bot_reviews else None
 
