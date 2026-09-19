@@ -18,8 +18,6 @@ export default function App() {
       <SignedIn>
         {view === 'registration' && <RegistrationPage onContinue={() => setView('dashboard')} />}
         {view === 'dashboard' && <Dashboard onManageRepos={() => setView('registration')} onOpenChat={() => setView('kt-chat')} />}
-        {view === 'kt-chat' && <KtChatPage onBack={() => setView('dashboard')} />} />
-        )}
         {view === 'kt-chat' && <KtChatPage onBack={() => setView('dashboard')} />}
       </SignedIn>
     </>

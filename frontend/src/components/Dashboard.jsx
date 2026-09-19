@@ -521,12 +521,6 @@ export default function Dashboard({ onManageRepos, onOpenChat }) {
             <p>Live comments posted by the CodeGuards AI review pipeline, across all registered repositories.</p>
           </div>
           {onManageRepos && (
-            <button className="secondary-button" type="button" onClick={onManageRepos}>
-              Manage repositories
-            </button>
-            <button className="primary-button" type="button" onClick={onOpenChat} style={{ marginLeft: '12px' }}>
-              Ask AI
-            </button>
             <>
               <button className="secondary-button" type="button" onClick={onManageRepos}>
                 Manage repositories
