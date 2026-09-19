@@ -38,7 +38,6 @@ app = FastAPI(
 
 cors_origins_str = os.getenv(
     "CORS_ORIGINS",
-    "http://localhost:5173,http://localhost:1805,http://localhost:1806,http://192.168.1.104:1805,http://192.168.1.104:1806,https://prreviewer.nik-server.in"
     "http://localhost:5173,http://localhost:1805,http://localhost:1806,http://192.168.1.104:1805,http://192.168.1.104:1806,https://prreviewer.nik-server.in,https://n8n.nik-server.in"
 )
 cors_origins = [origin.strip() for origin in cors_origins_str.split(",")]
