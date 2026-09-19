@@ -39,6 +39,7 @@ app = FastAPI(
 cors_origins_str = os.getenv(
     "CORS_ORIGINS",
     "http://localhost:5173,http://localhost:1805,http://localhost:1806,http://192.168.1.104:1805,http://192.168.1.104:1806,https://prreviewer.nik-server.in"
+    "http://localhost:5173,http://localhost:1805,http://localhost:1806,http://192.168.1.104:1805,http://192.168.1.104:1806,https://prreviewer.nik-server.in,https://n8n.nik-server.in"
 )
 cors_origins = [origin.strip() for origin in cors_origins_str.split(",")]
 
@@ -941,7 +942,11 @@ async def send_kt_chat_query(payload: ChatRequest, user_id: str = Depends(get_cu
     summary="Receive answer callback from n8n KT Chatbot",
     response_description="Acknowledges receipt of answer.",
 )
-async def kt_chat_callback(callback: ChatCallback) -> dict[str, str]:
+async def kt_chat_callback(callback: ChatCallback, x_internal_token: str = Header(default="")) -> dict[str, str]:
+    expected_token = os.getenv("N8N_INTERNAL_TOKEN")
+    if not expected_token or not secrets.compare_digest(x_internal_token, expected_token):
+        raise HTTPException(status_code=401, detail="Missing or invalid X-Internal-Token header.")
+        
     with sqlite3.connect(DATABASE_PATH) as connection:
         connection.execute(
             """
