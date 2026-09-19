@@ -14,8 +14,6 @@ services:
       - ./backend/.env
     environment:
       - SQLITE_DATABASE=/data/pr_reviewer.db
-    extra_hosts:
-      - "n8n.nik-server.in:192.168.1.104"
     restart: unless-stopped
 
   frontend:
