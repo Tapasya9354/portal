@@ -77,7 +77,6 @@ export default function KtChatPage({ onBack }) {
     return () => { cancelled = true; };
   }, [selectedRepoId, getToken]);
 
-  // Load & Poll Messages
   const hasProcessing = messages.some(m => m.status === 'processing');
 
   // Load messages when selectedSessionId changes
@@ -88,8 +87,6 @@ export default function KtChatPage({ onBack }) {
     }
     
     let cancelled = false;
-    let timer = null;
-
     async function loadMessages() {
       try {
         const token = await getToken();
@@ -115,9 +112,6 @@ export default function KtChatPage({ onBack }) {
         const list = await fetchJson(`/api/kt/chat/messages?session_id=${selectedSessionId}`, token);
         if (!cancelled) {
           setMessages(list);
-          const isProcessing = list.some(m => m.status === 'processing');
-          if (isProcessing) {
-            timer = setTimeout(loadMessages, 3000);
           if (!list.some(m => m.status === 'processing')) {
             clearInterval(interval);
           }
@@ -125,18 +119,12 @@ export default function KtChatPage({ onBack }) {
       } catch (e) {
         console.error(e);
       }
-    }
-    
-    loadMessages();
-    
     }, 1500);
 
     return () => {
       cancelled = true;
-      if (timer) clearTimeout(timer);
       clearInterval(interval);
     };
-  }, [selectedSessionId, getToken]);
   }, [selectedSessionId, hasProcessing, getToken]);
 
   // Auto-scroll to bottom of chat
@@ -188,9 +176,6 @@ export default function KtChatPage({ onBack }) {
         throw new Error(detail);
       }
       
-      // Immediately reload messages from backend for instant rendering
-      const updatedList = await fetchJson(`/api/kt/chat/messages?session_id=${sessionId}`, token);
-      setMessages(updatedList);
       const dispatch = await res.json();
 
       // If it's a new session, refresh session list
@@ -231,7 +216,6 @@ export default function KtChatPage({ onBack }) {
             const updated = await fetchJson(`/api/kt/chat/messages?session_id=${sessionId}`, token);
             setMessages(updated);
           }
-          // If n8n runs asynchronously, the polling in loadMessages() will automatically pick up the completed answer when n8n calls back!
           // If n8n runs asynchronously, the reactive polling will automatically pick up the completed answer as soon as n8n calls back!
         } catch (n8nErr) {
           console.warn('Frontend call to n8n failed, using curated fallback:', n8nErr);
@@ -248,7 +232,6 @@ export default function KtChatPage({ onBack }) {
             }),
           });
           const updated = await fetchJson(`/api/kt/chat/messages?session_id=${sessionId}`, token);
-          setMessages(updated);
         }
       }
     } catch (err) {
